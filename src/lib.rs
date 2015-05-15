@@ -1,7 +1,8 @@
 use std::thread::{self, JoinHandle};
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::sync::{Arc, Mutex, Barrier};
-use std::cell::RefCell;
+use std::cell::{RefCell, Cell};
+//use std::marker::PhantomData;
 
 enum Message {
     NewJob(Thunk<'static>),
@@ -22,6 +23,7 @@ type Thunk<'a> = Box<FnBox + Send + 'a>;
 
 impl Drop for PoolCache {
     fn drop(&mut self) {
+        println!("Ending {} threads (outer)...", self.threads.len());
         ::std::mem::replace(&mut self.job_sender, None);
     }
 }
@@ -41,9 +43,9 @@ impl PoolCache {
                                      Barrier::new(n as usize + 1)));
 
         let mut threads = Vec::with_capacity(n as usize);
-        for _ in 0..n {
+        for ti in 0..n {
             let job_receiver = job_receiver.clone();
-
+            println!("Creating thread {}...", ti);
             threads.push(thread::spawn(move || {
                 loop {
                     let message = {
@@ -58,15 +60,15 @@ impl PoolCache {
                             job.call_box();
                         }
                         Ok(Message::Join) => {
-                            println!("  Joining thread...");
+                            println!("  Joining thread {}...", ti);
                             job_receiver.1.wait();
-                            println!("  Joined thread");
+                            println!("  Joined thread {}", ti);
                         }
                         // The pool was dropped.
                         Err(..) => break
                     }
                 }
-                ()
+                println!("Ending thread {} (inner)", ti);
             }));
         }
 
@@ -82,21 +84,21 @@ impl PoolCache {
     pub fn scope<'pool, 'scope, F, R>(&'pool mut self, f: F) -> R
         where F: FnOnce(&Scope<'pool, 'scope>) -> R
     {
-        let mut scope = Scope { pool: self, dtors: RefCell::new(None) };
+        println!(" Scope start");
+        let mut scope = Scope { pool: self, dtors: RefCell::new(None), exec_counter: Cell::new(0) };
         let ret = f(&scope);
         scope.drop_all();
+        println!(" Scope end");
         ret
     }
-
 }
-
-use std::marker::PhantomData;
 
 /////////////////////////////////////////////////////////////////////////////
 
 pub struct Scope<'pool, 'scope> {
     pool: &'pool mut PoolCache,
-    dtors: RefCell<Option<DtorChain<'scope>>>
+    dtors: RefCell<Option<DtorChain<'scope>>>,
+    exec_counter: Cell<u32>,
 }
 
 struct DtorChain<'a> {
@@ -120,14 +122,17 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
                     *dtors = node.next.take().map(|b| *b);
                     node.dtor
                 } else {
-                    return
+                    break
                 }
             };
             dtor.call_box()
         }
+        println!("  Joining master...");
+        self.pool.join_barrier.1.wait();
+        println!("  Joined master");
     }
 
-    pub fn defer<F>(&self, f: F) where F: FnOnce() + 'scope {
+    fn defer<F>(&self, f: F) where F: FnOnce() + 'scope {
         let mut dtors = self.dtors.borrow_mut();
         *dtors = Some(DtorChain {
             dtor: Box::new(f),
@@ -135,24 +140,22 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
         });
     }
 
-    pub fn spawn<F, T>(&self, f: F)// -> thread::JoinHandle<T>
-        where F: FnOnce() /*-> T*/ + Send + 'scope/*,
-              T: Send + 'scope*/
+    pub fn execute<F>(&'scope self, f: F)
+        where F: FnOnce() + Send + 'scope
     {
         let b = unsafe {
             ::std::mem::transmute::<Thunk<'scope>, Thunk<'static>>(Box::new(f))
         };
+        let id = self.exec_counter.get();
+        println!("  exec {}: Sending thread job...", id);
         self.pool.job_sender.as_ref().unwrap().send(Message::NewJob(b)).unwrap();
+        println!("  exec {}: Sent thread job", id);
         self.defer(move || {
-            println!("  Sending thread joins...");
-            for _ in 0..self.pool.threads.len() {
-                self.pool.job_sender.as_ref().unwrap().send(Message::Join).unwrap();
-            }
-            println!("  Sent thread joins");
-            println!("  Joining master...");
-            self.pool.join_barrier.1.wait();
-            println!("  Joined master");
+            println!("  exec {}: Sending thread join...", id);
+            self.pool.job_sender.as_ref().unwrap().send(Message::Join).unwrap();
+            println!("  exec {}: Sent thread join", id);
         });
+        self.exec_counter.set(self.exec_counter.get() + 1);
     }
 }
 
@@ -167,10 +170,13 @@ fn smoketest() {
     let mut pool = PoolCache::new(4);
 
     for i in 0..6 {
-        let mut vec = vec![0; 5];
+        let mut vec = vec![1,2];
         pool.scope(|s| {
             for e in &mut vec {
-                s.spawn(|| *e += i);
+                s.execute(|| {
+                    thread::sleep_ms(1000);
+                    *e += i
+                });
             }
         });
     }
