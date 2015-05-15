@@ -62,7 +62,7 @@ impl PoolCache {
                         Ok(Message::Join) => {
                             println!("  Joining thread {}...", ti);
                             job_receiver.1.wait();
-                            println!("  Joined thread {}", ti);
+                            println!("    Joined thread {}", ti);
                         }
                         // The pool was dropped.
                         Err(..) => break
@@ -127,9 +127,16 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
             };
             dtor.call_box()
         }
+
+        for ti in 0..self.pool.threads.len() {
+            println!("  Sending thread {} join...", ti);
+            self.pool.job_sender.as_ref().unwrap().send(Message::Join).unwrap();
+            println!("  Sent thread {} join", ti);
+        }
+
         println!("  Joining master...");
         self.pool.join_barrier.1.wait();
-        println!("  Joined master");
+        println!("    Joined master");
     }
 
     fn defer<F>(&self, f: F) where F: FnOnce() + 'scope {
@@ -151,9 +158,7 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
         self.pool.job_sender.as_ref().unwrap().send(Message::NewJob(b)).unwrap();
         println!("  exec {}: Sent thread job", id);
         self.defer(move || {
-            println!("  exec {}: Sending thread join...", id);
-            self.pool.job_sender.as_ref().unwrap().send(Message::Join).unwrap();
-            println!("  exec {}: Sent thread join", id);
+
         });
         self.exec_counter.set(self.exec_counter.get() + 1);
     }
@@ -169,13 +174,15 @@ impl<'pool, 'scope> Drop for Scope<'pool, 'scope> {
 fn smoketest() {
     let mut pool = PoolCache::new(4);
 
-    for i in 0..6 {
-        let mut vec = vec![1,2];
+    for i in 1..7 {
+        let mut vec = vec![0, 1];
         pool.scope(|s| {
-            for e in &mut vec {
-                s.execute(|| {
+            for (j, e) in vec.iter_mut().enumerate() {
+                s.execute(move || {
+                    println!("      vec[{}] == {}, += 1 ...", j, *e);
                     thread::sleep_ms(1000);
-                    *e += i
+                    *e += i;
+                    println!("      vec[{}] == {}", j, *e);
                 });
             }
         });
