@@ -2,7 +2,7 @@ use std::thread::{self, JoinHandle};
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::sync::{Arc, Mutex, Barrier};
 use std::cell::{RefCell, Cell};
-//use std::marker::PhantomData;
+use std::marker::PhantomData;
 
 enum Message {
     NewJob(Thunk<'static>),
@@ -85,7 +85,12 @@ impl PoolCache {
         where F: FnOnce(&Scope<'pool, 'scope>) -> R
     {
         println!(" Scope start");
-        let mut scope = Scope { pool: self, dtors: RefCell::new(None), exec_counter: Cell::new(0) };
+        let mut scope = Scope {
+            pool: self,
+            dtors: RefCell::new(None),
+            exec_counter: Cell::new(0),
+            _marker: PhantomData,
+        };
         let ret = f(&scope);
         scope.drop_all();
         println!(" Scope end");
@@ -99,6 +104,7 @@ pub struct Scope<'pool, 'scope> {
     pool: &'pool mut PoolCache,
     dtors: RefCell<Option<DtorChain<'scope>>>,
     exec_counter: Cell<u32>,
+    _marker: PhantomData<&'scope mut ()>,
 }
 
 struct DtorChain<'a> {
@@ -147,7 +153,7 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
         });
     }
 
-    pub fn execute<F>(&'scope self, f: F)
+    pub fn execute<F>(&self, f: F)
         where F: FnOnce() + Send + 'scope
     {
         let b = unsafe {
@@ -170,17 +176,19 @@ impl<'pool, 'scope> Drop for Scope<'pool, 'scope> {
     }
 }
 
+/////////////////////////////////////////////////////////////////////////////
+
 #[test]
 fn smoketest() {
     let mut pool = PoolCache::new(4);
 
     for i in 1..7 {
-        let mut vec = vec![0, 1];
+        let mut vec = vec![0, 1, 2, 3, 4];
         pool.scope(|s| {
             for (j, e) in vec.iter_mut().enumerate() {
                 s.execute(move || {
                     println!("      vec[{}] == {}, += 1 ...", j, *e);
-                    thread::sleep_ms(1000);
+                    thread::sleep_ms(1000 + i * 100);
                     *e += i;
                     println!("      vec[{}] == {}", j, *e);
                 });

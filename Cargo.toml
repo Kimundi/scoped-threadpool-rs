@@ -1,4 +1,4 @@
 [package]
-name = "release_scoped_threads"
+name = "scoped_thread_pool"
 version = "0.1.0"
 authors = ["Marvin Löbel <loebel.marvin@gmail.com>"]
