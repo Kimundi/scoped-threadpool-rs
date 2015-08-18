@@ -214,7 +214,9 @@ mod tests {
     lazy_static! {
         static ref POOL_1: Mutex<PoolCache> = Mutex::new(PoolCache::new(1));
         static ref POOL_2: Mutex<PoolCache> = Mutex::new(PoolCache::new(2));
+        static ref POOL_3: Mutex<PoolCache> = Mutex::new(PoolCache::new(3));
         static ref POOL_4: Mutex<PoolCache> = Mutex::new(PoolCache::new(4));
+        static ref POOL_5: Mutex<PoolCache> = Mutex::new(PoolCache::new(5));
         static ref POOL_8: Mutex<PoolCache> = Mutex::new(PoolCache::new(8));
     }
 
@@ -225,8 +227,8 @@ mod tests {
         pool.scope(|s| {
             for e in data.iter_mut() {
                 s.execute(move || {
-                    *e += 1;
-                    //thread::sleep_ms(MS_SLEEP_PER_OP);
+                    *e += black_box(1);
+                    thread::sleep_ms(MS_SLEEP_PER_OP);
                 });
             }
         });
@@ -254,7 +256,7 @@ mod tests {
     }
 
     fn threads_chunked_n(pool: &mut PoolCache) {
-        let size = 1024 * 1024 * 1; // 1MiB
+        let size = 1024 * 1024 * 100; // 1MiB
 
         let n = pool.thread_count();
         let mut data = vec![0u8; size];
@@ -262,14 +264,18 @@ mod tests {
             let l = (data.len() - 1) / n as usize + 1;
             for es in data.chunks_mut(l) {
                 s.execute(move || {
-                    for e in es {
-                        *e += 1;
+                    if es.len() > 1 {
+                        es[0] = 1;
+                        es[1] = 1;
+                        for i in 2..es.len() {
+                            es[i] = es[i-1] + es[i-2];
+                        }
                     }
-                    thread::sleep_ms(MS_SLEEP_PER_OP);
+                    //thread::sleep_ms(MS_SLEEP_PER_OP);
                 });
             }
         });
-        assert_eq!(data, vec![1u8; size]);
+        //assert_eq!(data, vec![1u8; size]);
     }
 
     #[bench]
@@ -283,8 +289,18 @@ mod tests {
     }
 
     #[bench]
+    fn threads_chunked_3(b: &mut Bencher) {
+        b.iter(|| threads_chunked_n(&mut POOL_3.lock().unwrap()))
+    }
+
+    #[bench]
     fn threads_chunked_4(b: &mut Bencher) {
         b.iter(|| threads_chunked_n(&mut POOL_4.lock().unwrap()))
+    }
+
+    #[bench]
+    fn threads_chunked_5(b: &mut Bencher) {
+        b.iter(|| threads_chunked_n(&mut POOL_5.lock().unwrap()))
     }
 
     #[bench]
