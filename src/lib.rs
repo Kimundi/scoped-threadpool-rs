@@ -1,7 +1,13 @@
+#![feature(test)]
+
+#[macro_use]
+#[cfg(test)]
+extern crate lazy_static;
+
 use std::thread::{self, JoinHandle};
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::sync::{Arc, Mutex, Barrier};
-use std::cell::{RefCell, Cell};
+use std::cell::RefCell;
 use std::marker::PhantomData;
 
 enum Message {
@@ -23,7 +29,6 @@ type Thunk<'a> = Box<FnBox + Send + 'a>;
 
 impl Drop for PoolCache {
     fn drop(&mut self) {
-        println!("Ending {} threads (outer)...", self.threads.len());
         ::std::mem::replace(&mut self.job_sender, None);
     }
 }
@@ -43,9 +48,8 @@ impl PoolCache {
                                      Barrier::new(n as usize + 1)));
 
         let mut threads = Vec::with_capacity(n as usize);
-        for ti in 0..n {
+        for _ in 0..n {
             let job_receiver = job_receiver.clone();
-            println!("Creating thread {}...", ti);
             threads.push(thread::spawn(move || {
                 loop {
                     let message = {
@@ -60,15 +64,12 @@ impl PoolCache {
                             job.call_box();
                         }
                         Ok(Message::Join) => {
-                            println!("  Joining thread {}...", ti);
                             job_receiver.1.wait();
-                            println!("    Joined thread {}", ti);
                         }
                         // The pool was dropped.
                         Err(..) => break
                     }
                 }
-                println!("Ending thread {} (inner)", ti);
             }));
         }
 
@@ -84,17 +85,18 @@ impl PoolCache {
     pub fn scope<'pool, 'scope, F, R>(&'pool mut self, f: F) -> R
         where F: FnOnce(&Scope<'pool, 'scope>) -> R
     {
-        println!(" Scope start");
         let mut scope = Scope {
             pool: self,
             dtors: RefCell::new(None),
-            exec_counter: Cell::new(0),
             _marker: PhantomData,
         };
         let ret = f(&scope);
         scope.drop_all();
-        println!(" Scope end");
         ret
+    }
+
+    pub fn thread_count(&self) -> u32 {
+        self.threads.len() as u32
     }
 }
 
@@ -103,7 +105,6 @@ impl PoolCache {
 pub struct Scope<'pool, 'scope> {
     pool: &'pool mut PoolCache,
     dtors: RefCell<Option<DtorChain<'scope>>>,
-    exec_counter: Cell<u32>,
     _marker: PhantomData<&'scope mut ()>,
 }
 
@@ -134,15 +135,11 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
             dtor.call_box()
         }
 
-        for ti in 0..self.pool.threads.len() {
-            println!("  Sending thread {} join...", ti);
+        for _ in 0..self.pool.threads.len() {
             self.pool.job_sender.as_ref().unwrap().send(Message::Join).unwrap();
-            println!("  Sent thread {} join", ti);
         }
 
-        println!("  Joining master...");
         self.pool.join_barrier.1.wait();
-        println!("    Joined master");
     }
 
     fn defer<F>(&self, f: F) where F: FnOnce() + 'scope {
@@ -159,14 +156,10 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
         let b = unsafe {
             ::std::mem::transmute::<Thunk<'scope>, Thunk<'static>>(Box::new(f))
         };
-        let id = self.exec_counter.get();
-        println!("  exec {}: Sending thread job...", id);
         self.pool.job_sender.as_ref().unwrap().send(Message::NewJob(b)).unwrap();
-        println!("  exec {}: Sent thread job", id);
         self.defer(move || {
 
         });
-        self.exec_counter.set(self.exec_counter.get() + 1);
     }
 }
 
@@ -178,21 +171,124 @@ impl<'pool, 'scope> Drop for Scope<'pool, 'scope> {
 
 /////////////////////////////////////////////////////////////////////////////
 
-#[test]
-fn smoketest() {
-    let mut pool = PoolCache::new(4);
+#[cfg(test)]
+mod tests {
+    extern crate test;
 
-    for i in 1..7 {
-        let mut vec = vec![0, 1, 2, 3, 4];
+    use self::test::{Bencher, black_box};
+    use super::PoolCache;
+    use std::sync::Mutex;
+    use std::thread;
+
+    #[test]
+    fn smoketest() {
+        let mut pool = PoolCache::new(4);
+
+        for i in 1..7 {
+            let mut vec = vec![0, 1, 2, 3, 4];
+            pool.scope(|s| {
+                for e in vec.iter_mut() {
+                    s.execute(move || {
+                        *e += i;
+                    });
+                }
+            });
+
+            let mut vec2 = vec![0, 1, 2, 3, 4];
+            for e in vec2.iter_mut() {
+                *e += i;
+            }
+
+            assert_eq!(vec, vec2);
+        }
+    }
+
+    #[test]
+    fn test_bench() {
+        threads_interleaved_n(&mut POOL_8.lock().unwrap());
+        threads_chunked_n(&mut POOL_8.lock().unwrap());
+    }
+
+    const MS_SLEEP_PER_OP: u32 = 1;
+
+    lazy_static! {
+        static ref POOL_1: Mutex<PoolCache> = Mutex::new(PoolCache::new(1));
+        static ref POOL_2: Mutex<PoolCache> = Mutex::new(PoolCache::new(2));
+        static ref POOL_4: Mutex<PoolCache> = Mutex::new(PoolCache::new(4));
+        static ref POOL_8: Mutex<PoolCache> = Mutex::new(PoolCache::new(8));
+    }
+
+    fn threads_interleaved_n(pool: &mut PoolCache)  {
+        let size = 1024; // 1kiB
+
+        let mut data = vec![0u8; size];
         pool.scope(|s| {
-            for (j, e) in vec.iter_mut().enumerate() {
+            for e in data.iter_mut() {
                 s.execute(move || {
-                    println!("      vec[{}] == {}, += 1 ...", j, *e);
-                    thread::sleep_ms(1000 + i * 100);
-                    *e += i;
-                    println!("      vec[{}] == {}", j, *e);
+                    *e += 1;
+                    //thread::sleep_ms(MS_SLEEP_PER_OP);
                 });
             }
         });
+        assert_eq!(data, vec![1u8; size]);
+    }
+
+    #[bench]
+    fn threads_interleaved_1(b: &mut Bencher) {
+        b.iter(|| threads_interleaved_n(&mut POOL_1.lock().unwrap()))
+    }
+
+    #[bench]
+    fn threads_interleaved_2(b: &mut Bencher) {
+        b.iter(|| threads_interleaved_n(&mut POOL_2.lock().unwrap()))
+    }
+
+    #[bench]
+    fn threads_interleaved_4(b: &mut Bencher) {
+        b.iter(|| threads_interleaved_n(&mut POOL_4.lock().unwrap()))
+    }
+
+    #[bench]
+    fn threads_interleaved_8(b: &mut Bencher) {
+        b.iter(|| threads_interleaved_n(&mut POOL_8.lock().unwrap()))
+    }
+
+    fn threads_chunked_n(pool: &mut PoolCache) {
+        let size = 1024 * 1024 * 1; // 1MiB
+
+        let n = pool.thread_count();
+        let mut data = vec![0u8; size];
+        pool.scope(|s| {
+            let l = (data.len() - 1) / n as usize + 1;
+            for es in data.chunks_mut(l) {
+                s.execute(move || {
+                    for e in es {
+                        *e += 1;
+                    }
+                    thread::sleep_ms(MS_SLEEP_PER_OP);
+                });
+            }
+        });
+        assert_eq!(data, vec![1u8; size]);
+    }
+
+    #[bench]
+    fn threads_chunked_1(b: &mut Bencher) {
+        b.iter(|| threads_chunked_n(&mut POOL_1.lock().unwrap()))
+    }
+
+    #[bench]
+    fn threads_chunked_2(b: &mut Bencher) {
+        b.iter(|| threads_chunked_n(&mut POOL_2.lock().unwrap()))
+    }
+
+    #[bench]
+    fn threads_chunked_4(b: &mut Bencher) {
+        b.iter(|| threads_chunked_n(&mut POOL_4.lock().unwrap()))
+    }
+
+    #[bench]
+    fn threads_chunked_8(b: &mut Bencher) {
+        b.iter(|| threads_chunked_n(&mut POOL_8.lock().unwrap()))
     }
 }

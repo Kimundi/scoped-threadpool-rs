@@ -2,3 +2,6 @@
 name = "scoped_thread_pool"
 version = "0.1.0"
 authors = ["Marvin Löbel <loebel.marvin@gmail.com>"]
+
+[dev-dependencies]
+lazy_static = "*"
