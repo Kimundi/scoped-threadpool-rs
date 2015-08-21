@@ -266,6 +266,7 @@ mod benches {
             for e in data.iter_mut() {
                 s.execute(move || {
                     *e += fib(black_box(1000 * (*e as u64))) as u8;
+                    for i in 0..10000 { black_box(i); }
                     //thread::sleep_ms(MS_SLEEP_PER_OP);
                 });
             }
@@ -293,7 +294,9 @@ mod benches {
     }
 
     fn threads_chunked_n(pool: &mut PoolCache) {
-        let size = 1024 * 1024 * 100 / 4; // 100MiB
+        // Set this to 1GB and 40 to get good but slooow results
+        let size = 1024 * 1024 * 10 / 4; // 10MiB
+        let bb_repeat = 50;
 
         let n = pool.thread_count();
         let mut data = vec![0u32; size];
@@ -307,7 +310,8 @@ mod benches {
                         for i in 2..es.len() {
                             // Fibonnaci gets big fast,
                             // so just wrap around all the time
-                            es[i] = es[i-1].wrapping_add(es[i-2]);
+                            es[i] = black_box(es[i-1].wrapping_add(es[i-2]));
+                            for i in 0..bb_repeat { black_box(i); }
                         }
                     }
                     //thread::sleep_ms(MS_SLEEP_PER_OP);
