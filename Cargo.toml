@@ -1,7 +1,18 @@
 [package]
-name = "scoped_thread_pool"
+name = "scoped_threadpool"
 version = "0.1.0"
 authors = ["Marvin Löbel <loebel.marvin@gmail.com>"]
+license = "MIT"
+
+description = "A library for scoped and cached threadpools."
+readme = "README.md"
+documentation = "http://kimundi.github.io/scoped-threadpool-rs/scoped_threadpool/index.html"
+
+repository = "https://github.com/Kimundi/scoped-threadpool-rs"
+keywords = ["thread", "scoped", "pool", "cached", "threadpool"]
 
 [dev-dependencies]
 lazy_static = "*"
+
+[features]
+nightly = []

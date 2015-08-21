@@ -1,4 +1,5 @@
-#![feature(test)]
+#![cfg_attr(all(feature="nightly", test), feature(test))]
+#![cfg_attr(feature="nightly", feature(const_fn))]
 
 #[macro_use]
 #[cfg(test)]
@@ -174,11 +175,30 @@ impl<'pool, 'scope> Drop for Scope<'pool, 'scope> {
 #[cfg(test)]
 mod tests {
     extern crate test;
-
-    use self::test::{Bencher, black_box};
     use super::PoolCache;
-    use std::sync::Mutex;
-    use std::thread;
+
+    #[test]
+    fn example() {
+        // Create a threadpool holding 4 threads
+        let mut pool = PoolCache::new(4);
+
+        let mut vec = vec![0, 1, 2, 3, 4, 5, 6, 7];
+
+        // Use the threads as scoped threads that can
+        // reference anything outside this closure
+        pool.scope(|scoped| {
+
+            // Create references to each element in the vector ...
+            for e in &mut vec {
+                // ... and add 1 to it in a seperate thread
+                scoped.execute(move || {
+                    *e += 1;
+                });
+            }
+        });
+
+        assert_eq!(vec, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
 
     #[test]
     fn smoketest() {
@@ -202,14 +222,17 @@ mod tests {
             assert_eq!(vec, vec2);
         }
     }
+}
 
-    #[test]
-    fn test_bench() {
-        threads_interleaved_n(&mut POOL_8.lock().unwrap());
-        threads_chunked_n(&mut POOL_8.lock().unwrap());
-    }
+#[cfg(test)]
+mod benches {
+    extern crate test;
 
-    const MS_SLEEP_PER_OP: u32 = 1;
+    use self::test::{Bencher, black_box};
+    use super::PoolCache;
+    use std::sync::Mutex;
+
+    // const MS_SLEEP_PER_OP: u32 = 1;
 
     lazy_static! {
         static ref POOL_1: Mutex<PoolCache> = Mutex::new(PoolCache::new(1));
@@ -220,19 +243,30 @@ mod tests {
         static ref POOL_8: Mutex<PoolCache> = Mutex::new(PoolCache::new(8));
     }
 
+    fn fib(n: u64) -> u64 {
+        let mut prev_prev: u64 = 1;
+        let mut prev = 1;
+        let mut current = 1;
+        for _ in 2..(n+1) {
+            current = prev_prev.wrapping_add(prev);
+            prev_prev = prev;
+            prev = current;
+        }
+        current
+    }
+
     fn threads_interleaved_n(pool: &mut PoolCache)  {
         let size = 1024; // 1kiB
 
-        let mut data = vec![0u8; size];
+        let mut data = vec![1u8; size];
         pool.scope(|s| {
             for e in data.iter_mut() {
                 s.execute(move || {
-                    *e += black_box(1);
-                    thread::sleep_ms(MS_SLEEP_PER_OP);
+                    *e += fib(black_box(1000 * (*e as u64))) as u8;
+                    //thread::sleep_ms(MS_SLEEP_PER_OP);
                 });
             }
         });
-        assert_eq!(data, vec![1u8; size]);
     }
 
     #[bench]
@@ -256,10 +290,10 @@ mod tests {
     }
 
     fn threads_chunked_n(pool: &mut PoolCache) {
-        let size = 1024 * 1024 * 100; // 1MiB
+        let size = 1024 * 1024 * 100 / 4; // 100MiB
 
         let n = pool.thread_count();
-        let mut data = vec![0u8; size];
+        let mut data = vec![0u32; size];
         pool.scope(|s| {
             let l = (data.len() - 1) / n as usize + 1;
             for es in data.chunks_mut(l) {
@@ -268,14 +302,15 @@ mod tests {
                         es[0] = 1;
                         es[1] = 1;
                         for i in 2..es.len() {
-                            es[i] = es[i-1] + es[i-2];
+                            // Fibonnaci gets big fast,
+                            // so just wrap around all the time
+                            es[i] = es[i-1].wrapping_add(es[i-2]);
                         }
                     }
                     //thread::sleep_ms(MS_SLEEP_PER_OP);
                 });
             }
         });
-        //assert_eq!(data, vec![1u8; size]);
     }
 
     #[bench]
