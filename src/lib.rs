@@ -221,6 +221,15 @@ mod tests {
 
     #[test]
     #[should_panic]
+    fn scope_panic() {
+        let mut pool = PoolCache::new(4);
+        pool.scope(|_scoped| {
+            panic!()
+        });
+    }
+
+    #[test]
+    #[should_panic]
     fn pool_panic() {
         let _pool = PoolCache::new(4);
         panic!()
