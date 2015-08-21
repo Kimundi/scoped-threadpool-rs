@@ -210,13 +210,20 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn panicking() {
+    fn thread_panic() {
         let mut pool = PoolCache::new(4);
         pool.scope(|scoped| {
             scoped.execute(move || {
                 panic!()
             });
         });
+    }
+
+    #[test]
+    #[should_panic]
+    fn pool_panic() {
+        let _pool = PoolCache::new(4);
+        panic!()
     }
 }
 
