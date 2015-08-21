@@ -6,8 +6,8 @@
 extern crate lazy_static;
 
 use std::thread::{self, JoinHandle};
-use std::sync::mpsc::{channel, Sender, Receiver};
-use std::sync::{Arc, Mutex, Barrier};
+use std::sync::mpsc::{channel, Sender, Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::marker::PhantomData;
 
 enum Message {
@@ -34,9 +34,14 @@ impl Drop for PoolCache {
 }
 
 pub struct PoolCache {
-    threads: Vec<JoinHandle<()>>,
-    job_sender: Option<Sender<Message>>,
-    join_barrier: Arc<(Mutex<Receiver<Message>>, Barrier)>,
+    threads: Vec<ThreadData>,
+    job_sender: Option<Sender<Message>>
+}
+
+struct ThreadData {
+    _thread_join_handle: JoinHandle<()>,
+    pool_sync_rx: Receiver<()>,
+    thread_sync_tx: SyncSender<()>,
 }
 
 impl PoolCache {
@@ -44,20 +49,25 @@ impl PoolCache {
         assert!(n >= 1);
 
         let (job_sender, job_receiver) = channel();
-        let job_receiver = Arc::new((Mutex::new(job_receiver),
-                                     Barrier::new(n as usize + 1)));
+        let job_receiver = Arc::new(Mutex::new(job_receiver));
 
         let mut threads = Vec::with_capacity(n as usize);
 
         // spawn n threads, put them in waiting mode
         for _ in 0..n {
             let job_receiver = job_receiver.clone();
-            threads.push(thread::spawn(move || {
+
+            let (pool_sync_tx, pool_sync_rx) =
+                sync_channel::<()>(0);
+            let (thread_sync_tx, thread_sync_rx) =
+                sync_channel::<()>(0);
+
+            let thread = thread::spawn(move || {
                 loop {
                     let message = {
                         // Only lock jobs for the time it takes
                         // to get a job, not run it.
-                        let lock = job_receiver.0.lock().unwrap();
+                        let lock = job_receiver.lock().unwrap();
                         lock.recv()
                     };
 
@@ -66,19 +76,34 @@ impl PoolCache {
                             job.call_box();
                         }
                         Ok(Message::Join) => {
-                            job_receiver.1.wait();
+                            // syncronize with pool
+                            if pool_sync_tx.send(()).is_err() {
+                                // The pool was dropped.
+                                break;
+                            }
+                            if thread_sync_rx.recv().is_err() {
+                                // The pool was dropped.
+                                break;
+                            }
                         }
-                        // The pool was dropped.
-                        Err(..) => break
+                        Err(..) => {
+                            // The pool was dropped.
+                            break
+                        }
                     }
                 }
-            }));
+            });
+
+            threads.push(ThreadData {
+                _thread_join_handle: thread,
+                pool_sync_rx: pool_sync_rx,
+                thread_sync_tx: thread_sync_tx,
+            });
         }
 
         PoolCache {
             threads: threads,
             job_sender: Some(job_sender),
-            join_barrier: job_receiver,
         }
     }
 
@@ -121,7 +146,13 @@ impl<'pool, 'scope> Drop for Scope<'pool, 'scope> {
             self.pool.job_sender.as_ref().unwrap().send(Message::Join).unwrap();
         }
 
-        self.pool.join_barrier.1.wait();
+        // syncronize with threads
+        for thread_data in &self.pool.threads {
+            thread_data.pool_sync_rx.recv().unwrap();
+        }
+        for thread_data in &self.pool.threads {
+            thread_data.thread_sync_tx.send(()).unwrap();
+        }
     }
 }
 
