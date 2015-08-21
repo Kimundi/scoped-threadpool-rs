@@ -8,7 +8,6 @@ extern crate lazy_static;
 use std::thread::{self, JoinHandle};
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::sync::{Arc, Mutex, Barrier};
-use std::cell::RefCell;
 use std::marker::PhantomData;
 
 enum Message {
@@ -49,6 +48,8 @@ impl PoolCache {
                                      Barrier::new(n as usize + 1)));
 
         let mut threads = Vec::with_capacity(n as usize);
+
+        // spawn n threads, put them in waiting mode
         for _ in 0..n {
             let job_receiver = job_receiver.clone();
             threads.push(thread::spawn(move || {
@@ -79,21 +80,16 @@ impl PoolCache {
             job_sender: Some(job_sender),
             join_barrier: job_receiver,
         }
-
-        // spawn n threads, put them in waiting mode
     }
 
     pub fn scope<'pool, 'scope, F, R>(&'pool mut self, f: F) -> R
         where F: FnOnce(&Scope<'pool, 'scope>) -> R
     {
-        let mut scope = Scope {
+        let scope = Scope {
             pool: self,
-            dtors: RefCell::new(None),
             _marker: PhantomData,
         };
-        let ret = f(&scope);
-        scope.drop_all();
-        ret
+        f(&scope)
     }
 
     pub fn thread_count(&self) -> u32 {
@@ -105,52 +101,10 @@ impl PoolCache {
 
 pub struct Scope<'pool, 'scope> {
     pool: &'pool mut PoolCache,
-    dtors: RefCell<Option<DtorChain<'scope>>>,
     _marker: PhantomData<&'scope mut ()>,
 }
 
-struct DtorChain<'a> {
-    dtor: Box<FnBox + 'a>,
-    next: Option<Box<DtorChain<'a>>>
-}
-
 impl<'pool, 'scope> Scope<'pool, 'scope> {
-    // This method is carefully written in a transactional style, so
-    // that it can be called directly and, if any dtor panics, can be
-    // resumed in the unwinding this causes. By initially running the
-    // method outside of any destructor, we avoid any leakage problems
-    // due to #14875.
-    fn drop_all(&mut self) {
-        loop {
-            // use a separate scope to ensure that the RefCell borrow
-            // is relinquished before running `dtor`
-            let dtor = {
-                let mut dtors = self.dtors.borrow_mut();
-                if let Some(mut node) = dtors.take() {
-                    *dtors = node.next.take().map(|b| *b);
-                    node.dtor
-                } else {
-                    break
-                }
-            };
-            dtor.call_box()
-        }
-
-        for _ in 0..self.pool.threads.len() {
-            self.pool.job_sender.as_ref().unwrap().send(Message::Join).unwrap();
-        }
-
-        self.pool.join_barrier.1.wait();
-    }
-
-    fn defer<F>(&self, f: F) where F: FnOnce() + 'scope {
-        let mut dtors = self.dtors.borrow_mut();
-        *dtors = Some(DtorChain {
-            dtor: Box::new(f),
-            next: dtors.take().map(Box::new)
-        });
-    }
-
     pub fn execute<F>(&self, f: F)
         where F: FnOnce() + Send + 'scope
     {
@@ -158,15 +112,16 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
             ::std::mem::transmute::<Thunk<'scope>, Thunk<'static>>(Box::new(f))
         };
         self.pool.job_sender.as_ref().unwrap().send(Message::NewJob(b)).unwrap();
-        self.defer(move || {
-
-        });
     }
 }
 
 impl<'pool, 'scope> Drop for Scope<'pool, 'scope> {
     fn drop(&mut self) {
-        self.drop_all()
+        for _ in 0..self.pool.threads.len() {
+            self.pool.job_sender.as_ref().unwrap().send(Message::Join).unwrap();
+        }
+
+        self.pool.join_barrier.1.wait();
     }
 }
 
@@ -220,6 +175,17 @@ mod tests {
 
             assert_eq!(vec, vec2);
         }
+    }
+
+    #[test]
+    #[should_panic]
+    fn panicking() {
+        let mut pool = PoolCache::new(4);
+        pool.scope(|scoped| {
+            scoped.execute(move || {
+                panic!()
+            });
+        });
     }
 }
 
