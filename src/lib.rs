@@ -174,7 +174,6 @@ impl<'pool, 'scope> Drop for Scope<'pool, 'scope> {
 
 #[cfg(test)]
 mod tests {
-    extern crate test;
     use super::PoolCache;
 
     #[test]
@@ -224,7 +223,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature="nightly"))]
 mod benches {
     extern crate test;
 
