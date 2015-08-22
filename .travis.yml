@@ -11,6 +11,7 @@ script:
 - |
   travis-cargo build &&
   travis-cargo test &&
+  rustdoc --test README.md -L dependency=./target/debug/deps --extern scoped_threadpool=./target/debug/libscoped_threadpool.rlib &&
   travis-cargo bench &&
   travis-cargo --only stable doc
 after_success:
