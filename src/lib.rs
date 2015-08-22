@@ -4,8 +4,8 @@
 //! without the need to respawn the underlying threads.
 //!
 //! Jobs are runnable by borrowing the pool for a given scope, during which
-//! an arbitrary number of jobs can be executed. These jobs can access data of
-//! any lifetime outside of the pool's scope, which allows working with
+//! an arbitrary number of them can be executed. These jobs can access data of
+//! any lifetime outside of the pools scope, which allows working on
 //! non-`'static` references in parallel.
 //!
 //! For safety reasons, a panic inside a worker thread will not be isolated,
