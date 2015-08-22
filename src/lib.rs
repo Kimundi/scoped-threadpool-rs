@@ -77,7 +77,7 @@ type Thunk<'a> = Box<FnBox + Send + 'a>;
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        mem::replace(&mut self.job_sender, None);
+        self.job_sender = None;
     }
 }
 
