@@ -203,7 +203,7 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
     /// The body of the closure will be send to one of the
     /// internal threads, and this method itself will not wait
     /// for its completion.
-    #[cfg(not(feature="nightly"))]
+    #[cfg(not(compiler_has_scoped_bugfix))]
     pub unsafe fn execute<F>(&self, f: F) where F: FnOnce() + Send + 'scope {
         self.execute_(f)
     }
@@ -213,7 +213,7 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
     /// The body of the closure will be send to one of the
     /// internal threads, and this method itself will not wait
     /// for its completion.
-    #[cfg(feature="nightly")]
+    #[cfg(compiler_has_scoped_bugfix)]
     pub fn execute<F>(&self, f: F) where F: FnOnce() + Send + 'scope {
         self.execute_(f)
     }
@@ -349,6 +349,16 @@ mod tests {
         });
 
         assert_eq!(rx.iter().take(3).collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    #[cfg(compiler_has_scoped_bugfix)]
+    fn safe_execute() {
+        let mut pool = Pool::new(4);
+        pool.scoped(|scoped| {
+            scoped.execute(move || {
+            });
+        });
     }
 }
 
