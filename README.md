@@ -28,8 +28,7 @@ git = "https://github.com/Kimundi/scoped-threadpool-rs"
 
 ```rust
 extern crate scoped_threadpool;
-
-use scoped_threadpool::*;
+use scoped_threadpool::Pool;
 
 fn main() {
     // Create a threadpool holding 4 threads
