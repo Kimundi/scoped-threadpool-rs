@@ -205,10 +205,9 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
         };
         self.pool.job_sender.as_ref().unwrap().send(Message::NewJob(b)).unwrap();
     }
-}
 
-impl<'pool, 'scope> Drop for Scope<'pool, 'scope> {
-    fn drop(&mut self) {
+    /// Blocks until all currently queued jobs have run to completion.
+    pub fn join_all(&self) {
         for _ in 0..self.pool.threads.len() {
             self.pool.job_sender.as_ref().unwrap().send(Message::Join).unwrap();
         }
@@ -230,11 +229,19 @@ impl<'pool, 'scope> Drop for Scope<'pool, 'scope> {
     }
 }
 
+impl<'pool, 'scope> Drop for Scope<'pool, 'scope> {
+    fn drop(&mut self) {
+        self.join_all();
+    }
+}
+
 /////////////////////////////////////////////////////////////////////////////
 
 #[cfg(test)]
 mod tests {
     use super::Pool;
+    use std::thread;
+    use std::sync;
 
     #[test]
     fn smoketest() {
@@ -284,6 +291,35 @@ mod tests {
     fn pool_panic() {
         let _pool = Pool::new(4);
         panic!()
+    }
+
+    #[test]
+    fn join_all() {
+        let mut pool = Pool::new(4);
+
+        let (tx_, rx) = sync::mpsc::channel();
+
+        pool.scoped(|scoped| {
+            let tx = tx_.clone();
+            scoped.execute(move || {
+                tx.send(1).unwrap();
+            });
+
+            let tx = tx_.clone();
+            scoped.execute(move || {
+                thread::sleep_ms(1000);
+                tx.send(2).unwrap();
+            });
+
+            scoped.join_all();
+
+            let tx = tx_.clone();
+            scoped.execute(move || {
+                tx.send(3).unwrap();
+            });
+        });
+
+        assert_eq!(rx.iter().take(3).collect::<Vec<_>>(), vec![1, 2, 3]);
     }
 }
 
