@@ -302,13 +302,13 @@ mod tests {
         pool.scoped(|scoped| {
             let tx = tx_.clone();
             scoped.execute(move || {
-                tx.send(1).unwrap();
+                thread::sleep_ms(1000);
+                tx.send(2).unwrap();
             });
 
             let tx = tx_.clone();
             scoped.execute(move || {
-                thread::sleep_ms(1000);
-                tx.send(2).unwrap();
+                tx.send(1).unwrap();
             });
 
             scoped.join_all();
