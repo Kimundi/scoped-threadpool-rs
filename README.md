@@ -38,7 +38,6 @@ fn main() {
     // Use the threads as scoped threads that can
     // reference anything outside this closure
     pool.scope(|scoped| {
-
         // Create references to each element in the vector ...
         for e in &mut vec {
             // ... and add 1 to it in a seperate thread

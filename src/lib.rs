@@ -1,5 +1,47 @@
+//! This crate provides a stable, safe and scoped threadpool.
+//!
+//! It can be used to execute a number of short-lived jobs in parallel
+//! without the need to respawn the underlying threads.
+//!
+//! Jobs are runnable by borrowing the pool for a given scope, during which
+//! an arbitrary number of jobs can be executed. These jobs can access data of
+//! any lifetime outside of the pool's scope, which allows working with
+//! non-`'static` references in parallel.
+//!
+//! For safety reasons, a panic inside a worker thread will not be isolated,
+//! but rather propagate to the outside of the pool.
+//!
+//! # Examples:
+//!
+//! ```rust
+//! extern crate scoped_threadpool;
+//! use scoped_threadpool::Pool;
+//!
+//! fn main() {
+//!     // Create a threadpool holding 4 threads
+//!     let mut pool = Pool::new(4);
+//!
+//!     let mut vec = vec![0, 1, 2, 3, 4, 5, 6, 7];
+//!
+//!     // Use the threads as scoped threads that can
+//!     // reference anything outside this closure
+//!     pool.scoped(|scope| {
+//!         // Create references to each element in the vector ...
+//!         for e in &mut vec {
+//!             // ... and add 1 to it in a seperate thread
+//!             scope.execute(move || {
+//!                 *e += 1;
+//!             });
+//!         }
+//!     });
+//!
+//!     assert_eq!(vec, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+//! }
+//! ```
+
 #![cfg_attr(all(feature="nightly", test), feature(test))]
 #![cfg_attr(feature="nightly", feature(const_fn))]
+#![warn(missing_docs)]
 
 #[macro_use]
 #[cfg(test)]
@@ -9,6 +51,7 @@ use std::thread::{self, JoinHandle};
 use std::sync::mpsc::{channel, Sender, Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::marker::PhantomData;
+use std::mem;
 
 enum Message {
     NewJob(Thunk<'static>),
@@ -27,13 +70,15 @@ impl<F: FnOnce()> FnBox for F {
 
 type Thunk<'a> = Box<FnBox + Send + 'a>;
 
-impl Drop for PoolCache {
+impl Drop for Pool {
     fn drop(&mut self) {
-        ::std::mem::replace(&mut self.job_sender, None);
+        mem::replace(&mut self.job_sender, None);
     }
 }
 
-pub struct PoolCache {
+/// A threadpool that acts as a handle to a number
+/// of threads spawned at construction.
+pub struct Pool {
     threads: Vec<ThreadData>,
     job_sender: Option<Sender<Message>>
 }
@@ -44,8 +89,10 @@ struct ThreadData {
     thread_sync_tx: SyncSender<()>,
 }
 
-impl PoolCache {
-    pub fn new(n: u32) -> PoolCache {
+impl Pool {
+    /// Construct a threadpool with the given number of threads.
+    /// Minimum value is `1`.
+    pub fn new(n: u32) -> Pool {
         assert!(n >= 1);
 
         let (job_sender, job_receiver) = channel();
@@ -76,11 +123,19 @@ impl PoolCache {
                             job.call_box();
                         }
                         Ok(Message::Join) => {
-                            // syncronize with pool
+                            // Syncronize/Join with pool.
+                            // This has to be a two step
+                            // process to ensure that all threads
+                            // finished their work before the pool
+                            // can continue
+
+                            // Wait until the pool started syncing with threads
                             if pool_sync_tx.send(()).is_err() {
                                 // The pool was dropped.
                                 break;
                             }
+
+                            // Wait until the pool finished syncing with threads
                             if thread_sync_rx.recv().is_err() {
                                 // The pool was dropped.
                                 break;
@@ -101,13 +156,18 @@ impl PoolCache {
             });
         }
 
-        PoolCache {
+        Pool {
             threads: threads,
             job_sender: Some(job_sender),
         }
     }
 
-    pub fn scope<'pool, 'scope, F, R>(&'pool mut self, f: F) -> R
+    /// Borrows the pool and allows executing jobs on other
+    /// threads during that scope via the argument of the closure.
+    ///
+    /// This method will block until the closure and all its jobs have
+    /// run to completion.
+    pub fn scoped<'pool, 'scope, F, R>(&'pool mut self, f: F) -> R
         where F: FnOnce(&Scope<'pool, 'scope>) -> R
     {
         let scope = Scope {
@@ -117,6 +177,7 @@ impl PoolCache {
         f(&scope)
     }
 
+    /// Returns the number of threads inside this pool.
     pub fn thread_count(&self) -> u32 {
         self.threads.len() as u32
     }
@@ -124,17 +185,23 @@ impl PoolCache {
 
 /////////////////////////////////////////////////////////////////////////////
 
+/// Handle to the scope during which the threadpool is borrowed.
 pub struct Scope<'pool, 'scope> {
-    pool: &'pool mut PoolCache,
+    pool: &'pool mut Pool,
     _marker: PhantomData<&'scope mut ()>,
 }
 
 impl<'pool, 'scope> Scope<'pool, 'scope> {
+    /// Execute a job on the threadpool.
+    ///
+    /// The body of the closure will be send to one of the
+    /// internal threads, and this method itself will not wait
+    /// for its completion.
     pub fn execute<F>(&self, f: F)
         where F: FnOnce() + Send + 'scope
     {
         let b = unsafe {
-            ::std::mem::transmute::<Thunk<'scope>, Thunk<'static>>(Box::new(f))
+            mem::transmute::<Thunk<'scope>, Thunk<'static>>(Box::new(f))
         };
         self.pool.job_sender.as_ref().unwrap().send(Message::NewJob(b)).unwrap();
     }
@@ -146,10 +213,17 @@ impl<'pool, 'scope> Drop for Scope<'pool, 'scope> {
             self.pool.job_sender.as_ref().unwrap().send(Message::Join).unwrap();
         }
 
-        // syncronize with threads
+        // Syncronize/Join with threads
+        // This has to be a two step process
+        // to make sure _all_ threads received _one_ Join message each.
+
+        // This loop will block on every thread until it
+        // received and reacted to its Join message.
         for thread_data in &self.pool.threads {
             thread_data.pool_sync_rx.recv().unwrap();
         }
+
+        // Once all threads joined the jobs, send them a continue message
         for thread_data in &self.pool.threads {
             thread_data.thread_sync_tx.send(()).unwrap();
         }
@@ -160,38 +234,15 @@ impl<'pool, 'scope> Drop for Scope<'pool, 'scope> {
 
 #[cfg(test)]
 mod tests {
-    use super::PoolCache;
-
-    #[test]
-    fn example() {
-        // Create a threadpool holding 4 threads
-        let mut pool = PoolCache::new(4);
-
-        let mut vec = vec![0, 1, 2, 3, 4, 5, 6, 7];
-
-        // Use the threads as scoped threads that can
-        // reference anything outside this closure
-        pool.scope(|scoped| {
-
-            // Create references to each element in the vector ...
-            for e in &mut vec {
-                // ... and add 1 to it in a seperate thread
-                scoped.execute(move || {
-                    *e += 1;
-                });
-            }
-        });
-
-        assert_eq!(vec, vec![1, 2, 3, 4, 5, 6, 7, 8]);
-    }
+    use super::Pool;
 
     #[test]
     fn smoketest() {
-        let mut pool = PoolCache::new(4);
+        let mut pool = Pool::new(4);
 
         for i in 1..7 {
             let mut vec = vec![0, 1, 2, 3, 4];
-            pool.scope(|s| {
+            pool.scoped(|s| {
                 for e in vec.iter_mut() {
                     s.execute(move || {
                         *e += i;
@@ -211,8 +262,8 @@ mod tests {
     #[test]
     #[should_panic]
     fn thread_panic() {
-        let mut pool = PoolCache::new(4);
-        pool.scope(|scoped| {
+        let mut pool = Pool::new(4);
+        pool.scoped(|scoped| {
             scoped.execute(move || {
                 panic!()
             });
@@ -222,8 +273,8 @@ mod tests {
     #[test]
     #[should_panic]
     fn scope_panic() {
-        let mut pool = PoolCache::new(4);
-        pool.scope(|_scoped| {
+        let mut pool = Pool::new(4);
+        pool.scoped(|_scoped| {
             panic!()
         });
     }
@@ -231,7 +282,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn pool_panic() {
-        let _pool = PoolCache::new(4);
+        let _pool = Pool::new(4);
         panic!()
     }
 }
@@ -241,18 +292,18 @@ mod benches {
     extern crate test;
 
     use self::test::{Bencher, black_box};
-    use super::PoolCache;
+    use super::Pool;
     use std::sync::Mutex;
 
     // const MS_SLEEP_PER_OP: u32 = 1;
 
     lazy_static! {
-        static ref POOL_1: Mutex<PoolCache> = Mutex::new(PoolCache::new(1));
-        static ref POOL_2: Mutex<PoolCache> = Mutex::new(PoolCache::new(2));
-        static ref POOL_3: Mutex<PoolCache> = Mutex::new(PoolCache::new(3));
-        static ref POOL_4: Mutex<PoolCache> = Mutex::new(PoolCache::new(4));
-        static ref POOL_5: Mutex<PoolCache> = Mutex::new(PoolCache::new(5));
-        static ref POOL_8: Mutex<PoolCache> = Mutex::new(PoolCache::new(8));
+        static ref POOL_1: Mutex<Pool> = Mutex::new(Pool::new(1));
+        static ref POOL_2: Mutex<Pool> = Mutex::new(Pool::new(2));
+        static ref POOL_3: Mutex<Pool> = Mutex::new(Pool::new(3));
+        static ref POOL_4: Mutex<Pool> = Mutex::new(Pool::new(4));
+        static ref POOL_5: Mutex<Pool> = Mutex::new(Pool::new(5));
+        static ref POOL_8: Mutex<Pool> = Mutex::new(Pool::new(8));
     }
 
     fn fib(n: u64) -> u64 {
@@ -267,11 +318,11 @@ mod benches {
         current
     }
 
-    fn threads_interleaved_n(pool: &mut PoolCache)  {
+    fn threads_interleaved_n(pool: &mut Pool)  {
         let size = 1024; // 1kiB
 
         let mut data = vec![1u8; size];
-        pool.scope(|s| {
+        pool.scoped(|s| {
             for e in data.iter_mut() {
                 s.execute(move || {
                     *e += fib(black_box(1000 * (*e as u64))) as u8;
@@ -302,14 +353,14 @@ mod benches {
         b.iter(|| threads_interleaved_n(&mut POOL_8.lock().unwrap()))
     }
 
-    fn threads_chunked_n(pool: &mut PoolCache) {
+    fn threads_chunked_n(pool: &mut Pool) {
         // Set this to 1GB and 40 to get good but slooow results
         let size = 1024 * 1024 * 10 / 4; // 10MiB
         let bb_repeat = 50;
 
         let n = pool.thread_count();
         let mut data = vec![0u32; size];
-        pool.scope(|s| {
+        pool.scoped(|s| {
             let l = (data.len() - 1) / n as usize + 1;
             for es in data.chunks_mut(l) {
                 s.execute(move || {
