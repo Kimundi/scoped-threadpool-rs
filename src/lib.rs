@@ -29,9 +29,12 @@
 //!         // Create references to each element in the vector ...
 //!         for e in &mut vec {
 //!             // ... and add 1 to it in a seperate thread
-//!             scope.execute(move || {
-//!                 *e += 1;
-//!             });
+//!             // (execute() is safe to call in nightly)
+//!             unsafe {
+//!                 scope.execute(move || {
+//!                     *e += 1;
+//!                 });
+//!             }
 //!         }
 //!     });
 //!
@@ -41,7 +44,9 @@
 
 #![cfg_attr(all(feature="nightly", test), feature(test))]
 #![cfg_attr(feature="nightly", feature(const_fn))]
+
 #![warn(missing_docs)]
+#![cfg_attr(feature="nightly", allow(unused_unsafe))]
 
 #[macro_use]
 #[cfg(test)]
@@ -188,7 +193,8 @@ impl Pool {
 /// Handle to the scope during which the threadpool is borrowed.
 pub struct Scope<'pool, 'scope> {
     pool: &'pool mut Pool,
-    _marker: PhantomData<&'scope mut ()>,
+    // The 'scope needs to be invariant... it seems?
+    _marker: PhantomData<::std::cell::Cell<&'scope mut ()>>,
 }
 
 impl<'pool, 'scope> Scope<'pool, 'scope> {
@@ -197,9 +203,22 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
     /// The body of the closure will be send to one of the
     /// internal threads, and this method itself will not wait
     /// for its completion.
-    pub fn execute<F>(&self, f: F)
-        where F: FnOnce() + Send + 'scope
-    {
+    #[cfg(not(feature="nightly"))]
+    pub unsafe fn execute<F>(&self, f: F) where F: FnOnce() + Send + 'scope {
+        self.execute_(f)
+    }
+
+    /// Execute a job on the threadpool.
+    ///
+    /// The body of the closure will be send to one of the
+    /// internal threads, and this method itself will not wait
+    /// for its completion.
+    #[cfg(feature="nightly")]
+    pub fn execute<F>(&self, f: F) where F: FnOnce() + Send + 'scope {
+        self.execute_(f)
+    }
+
+    fn execute_<F>(&self, f: F) where F: FnOnce() + Send + 'scope {
         let b = unsafe {
             mem::transmute::<Thunk<'scope>, Thunk<'static>>(Box::new(f))
         };
@@ -251,9 +270,11 @@ mod tests {
             let mut vec = vec![0, 1, 2, 3, 4];
             pool.scoped(|s| {
                 for e in vec.iter_mut() {
-                    s.execute(move || {
-                        *e += i;
-                    });
+                    unsafe {
+                        s.execute(move || {
+                            *e += i;
+                        });
+                    }
                 }
             });
 
@@ -271,9 +292,11 @@ mod tests {
     fn thread_panic() {
         let mut pool = Pool::new(4);
         pool.scoped(|scoped| {
-            scoped.execute(move || {
-                panic!()
-            });
+            unsafe {
+                scoped.execute(move || {
+                    panic!()
+                });
+            }
         });
     }
 
@@ -301,22 +324,28 @@ mod tests {
 
         pool.scoped(|scoped| {
             let tx = tx_.clone();
-            scoped.execute(move || {
-                thread::sleep_ms(1000);
-                tx.send(2).unwrap();
-            });
+            unsafe {
+                scoped.execute(move || {
+                    thread::sleep_ms(1000);
+                    tx.send(2).unwrap();
+                });
+            }
 
             let tx = tx_.clone();
-            scoped.execute(move || {
-                tx.send(1).unwrap();
-            });
+            unsafe {
+                scoped.execute(move || {
+                    tx.send(1).unwrap();
+                });
+            }
 
             scoped.join_all();
 
             let tx = tx_.clone();
-            scoped.execute(move || {
-                tx.send(3).unwrap();
-            });
+            unsafe {
+                scoped.execute(move || {
+                    tx.send(3).unwrap();
+                });
+            }
         });
 
         assert_eq!(rx.iter().take(3).collect::<Vec<_>>(), vec![1, 2, 3]);
@@ -360,11 +389,13 @@ mod benches {
         let mut data = vec![1u8; size];
         pool.scoped(|s| {
             for e in data.iter_mut() {
-                s.execute(move || {
-                    *e += fib(black_box(1000 * (*e as u64))) as u8;
-                    for i in 0..10000 { black_box(i); }
-                    //thread::sleep_ms(MS_SLEEP_PER_OP);
-                });
+                unsafe {
+                    s.execute(move || {
+                        *e += fib(black_box(1000 * (*e as u64))) as u8;
+                        for i in 0..10000 { black_box(i); }
+                        //thread::sleep_ms(MS_SLEEP_PER_OP);
+                    });
+                }
             }
         });
     }
@@ -399,19 +430,21 @@ mod benches {
         pool.scoped(|s| {
             let l = (data.len() - 1) / n as usize + 1;
             for es in data.chunks_mut(l) {
-                s.execute(move || {
-                    if es.len() > 1 {
-                        es[0] = 1;
-                        es[1] = 1;
-                        for i in 2..es.len() {
-                            // Fibonnaci gets big fast,
-                            // so just wrap around all the time
-                            es[i] = black_box(es[i-1].wrapping_add(es[i-2]));
-                            for i in 0..bb_repeat { black_box(i); }
+                unsafe {
+                    s.execute(move || {
+                        if es.len() > 1 {
+                            es[0] = 1;
+                            es[1] = 1;
+                            for i in 2..es.len() {
+                                // Fibonnaci gets big fast,
+                                // so just wrap around all the time
+                                es[i] = black_box(es[i-1].wrapping_add(es[i-2]));
+                                for i in 0..bb_repeat { black_box(i); }
+                            }
                         }
-                    }
-                    //thread::sleep_ms(MS_SLEEP_PER_OP);
-                });
+                        //thread::sleep_ms(MS_SLEEP_PER_OP);
+                    });
+                }
             }
         });
     }
