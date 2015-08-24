@@ -1,6 +1,6 @@
 [package]
 name = "scoped_threadpool"
-version = "0.1.5"
+version = "0.1.6"
 authors = ["Marvin Löbel <loebel.marvin@gmail.com>"]
 license = "MIT"
 build = "build.rs"
