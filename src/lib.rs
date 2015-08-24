@@ -46,7 +46,6 @@
 #![cfg_attr(feature="nightly", feature(const_fn))]
 
 #![warn(missing_docs)]
-#![cfg_attr(feature="nightly", allow(unused_unsafe))]
 
 #[macro_use]
 #[cfg(test)]
@@ -258,6 +257,8 @@ impl<'pool, 'scope> Drop for Scope<'pool, 'scope> {
 
 #[cfg(test)]
 mod tests {
+    #![cfg_attr(feature="nightly", allow(unused_unsafe))]
+
     use super::Pool;
     use std::thread;
     use std::sync;
@@ -399,13 +400,11 @@ mod benches {
         let mut data = vec![1u8; size];
         pool.scoped(|s| {
             for e in data.iter_mut() {
-                unsafe {
-                    s.execute(move || {
-                        *e += fib(black_box(1000 * (*e as u64))) as u8;
-                        for i in 0..10000 { black_box(i); }
-                        //thread::sleep_ms(MS_SLEEP_PER_OP);
-                    });
-                }
+                s.execute(move || {
+                    *e += fib(black_box(1000 * (*e as u64))) as u8;
+                    for i in 0..10000 { black_box(i); }
+                    //thread::sleep_ms(MS_SLEEP_PER_OP);
+                });
             }
         });
     }
@@ -440,21 +439,19 @@ mod benches {
         pool.scoped(|s| {
             let l = (data.len() - 1) / n as usize + 1;
             for es in data.chunks_mut(l) {
-                unsafe {
-                    s.execute(move || {
-                        if es.len() > 1 {
-                            es[0] = 1;
-                            es[1] = 1;
-                            for i in 2..es.len() {
-                                // Fibonnaci gets big fast,
-                                // so just wrap around all the time
-                                es[i] = black_box(es[i-1].wrapping_add(es[i-2]));
-                                for i in 0..bb_repeat { black_box(i); }
-                            }
+                s.execute(move || {
+                    if es.len() > 1 {
+                        es[0] = 1;
+                        es[1] = 1;
+                        for i in 2..es.len() {
+                            // Fibonnaci gets big fast,
+                            // so just wrap around all the time
+                            es[i] = black_box(es[i-1].wrapping_add(es[i-2]));
+                            for i in 0..bb_repeat { black_box(i); }
                         }
-                        //thread::sleep_ms(MS_SLEEP_PER_OP);
-                    });
-                }
+                    }
+                    //thread::sleep_ms(MS_SLEEP_PER_OP);
+                });
             }
         });
     }
