@@ -42,12 +42,9 @@ fn main() {
         // Create references to each element in the vector ...
         for e in &mut vec {
             // ... and add 1 to it in a seperate thread
-            // (execute() is safe to call in nightly)
-            unsafe {
-                scoped.execute(move || {
-                    *e += 1;
-                });
-            }
+            scoped.execute(move || {
+                *e += 1;
+            });
         }
     });
 
