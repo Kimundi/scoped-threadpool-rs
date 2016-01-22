@@ -32,22 +32,21 @@ use scoped_threadpool::Pool;
 
 fn main() {
     // Create a threadpool holding 4 threads
-    let mut pool = Pool::new(4);
+    let pool = Pool::new(4);
+    let manager = pool.manager();
 
     let mut vec = vec![0, 1, 2, 3, 4, 5, 6, 7];
 
     // Use the threads as scoped threads that can
     // reference anything outside this closure
-    pool.scoped(|scoped| {
+    manager.scoped(|scoped| {
         // Create references to each element in the vector ...
         for e in &mut vec {
-            // ... and add 1 to it in a seperate thread
+            // ... and add 1 to it in a separate thread
             // (execute() is safe to call in nightly)
-            unsafe {
-                scoped.execute(move || {
-                    *e += 1;
-                });
-            }
+            scoped.submit(move || {
+                *e += 1;
+            });
         }
     });
 
