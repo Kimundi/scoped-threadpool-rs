@@ -19,7 +19,7 @@
 //!
 //! fn main() {
 //!     // Create a threadpool holding 4 threads
-//!     let mut pool = Pool::new(4);
+//!     let pool = Pool::new(4);
 //!
 //!     let mut vec = vec![0, 1, 2, 3, 4, 5, 6, 7];
 //!
@@ -28,13 +28,10 @@
 //!     pool.scoped(|scope| {
 //!         // Create references to each element in the vector ...
 //!         for e in &mut vec {
-//!             // ... and add 1 to it in a seperate thread
-//!             // (execute() is safe to call in nightly)
-//!             unsafe {
-//!                 scope.execute(move || {
-//!                     *e += 1;
-//!                 });
-//!             }
+//!             // ... and add 1 to it in a separate thread
+//!             scope.execute(move || {
+//!                 *e += 1;
+//!             });
 //!         }
 //!     });
 //!
@@ -42,240 +39,489 @@
 //! }
 //! ```
 
-#![cfg_attr(all(feature="nightly", test), feature(test))]
-#![cfg_attr(feature="nightly", feature(const_fn))]
-
 #![warn(missing_docs)]
 
-#[macro_use]
-#[cfg(test)]
-extern crate lazy_static;
+extern crate crossbeam;
 
-use std::thread::{self, JoinHandle};
-use std::sync::mpsc::{channel, Sender, Receiver, SyncSender, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::borrow::{Borrow, BorrowMut};
 use std::marker::PhantomData;
 use std::mem;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Condvar};
+use std::thread::{self};
+use std::usize;
 
-enum Message {
-    NewJob(Thunk<'static>),
-    Join,
+use crossbeam::sync::MsQueue;
+
+struct Semaphore {
+    lock: Mutex<(usize, bool)>,
+    cvar: Condvar,
 }
 
-trait FnBox {
-    fn call_box(self: Box<Self>);
+impl Semaphore {
+    fn new(count: usize) -> Semaphore {
+        Semaphore {
+            lock: Mutex::new((count, false)),
+            cvar: Condvar::new(),
+        }
+    }
+
+    fn panicked(&self) -> bool {
+        self.lock.lock().unwrap().1
+    }
+
+    fn acquire(&self, count: usize) -> bool {
+        let mut v = self.lock.lock().unwrap();
+        while v.0 < count {
+            v = self.cvar.wait(v).unwrap();
+        }
+        v.0 -= count;
+        v.1 |= thread::panicking();
+        v.1
+    }
+
+    fn acquire_all(&self) -> (usize, bool) {
+        let mut v = self.lock.lock().unwrap();
+        v.1 |= thread::panicking();
+        (mem::replace(&mut v.0, 0), v.1)
+    }
+
+    fn release(&self) {
+        let mut v = self.lock.lock().unwrap();
+        v.0 += 1;
+        v.1 |= thread::panicking();
+        self.cvar.notify_one();
+    }
 }
 
-impl<F: FnOnce()> FnBox for F {
-    fn call_box(self: Box<F>) {
+//    d88b  .d88b.  d8888b.
+//    `8P' .8P  Y8. 88  `8D
+//     88  88    88 88oooY'
+//     88  88    88 88~~~b.
+// db. 88  `8b  d8' 88   8D
+// Y8888P   `Y88P'  Y8888P'
+
+/// TODO: Convert to std::boxed::FnBox. Blocked by rust-lang/rust#28796
+trait FnBox<A, R> {
+    fn call_box(self: Box<Self>, a: A) -> R;
+}
+
+impl<F: FnOnce()> FnBox<(), ()> for F {
+    fn call_box(self: Box<F>, _: ()) {
         (*self)()
     }
 }
 
-type Thunk<'a> = Box<FnBox + Send + 'a>;
+struct SemaphoreGuard<'pool>(&'pool Semaphore);
 
-impl Drop for Pool {
+impl <'pool> Drop for SemaphoreGuard<'pool> {
     fn drop(&mut self) {
-        self.job_sender = None;
+        self.0.release()
     }
 }
 
-/// A threadpool that acts as a handle to a number
-/// of threads spawned at construction.
-pub struct Pool {
-    threads: Vec<ThreadData>,
-    job_sender: Option<Sender<Message>>
+type Thunk<'a> = Box<FnBox<(), ()> + Send + 'a>;
+
+enum Message {
+    Job(Thunk<'static>),
+    ScopedJob {
+        job: Thunk<'static>,
+        semaphore: &'static Semaphore,
+    },
+    Remove,
+    Dropping,
 }
 
-struct ThreadData {
-    _thread_join_handle: JoinHandle<()>,
-    pool_sync_rx: Receiver<()>,
-    thread_sync_tx: SyncSender<()>,
+// .d8888. d88888b d8b   db d888888b d888888b d8b   db d88888b db
+// 88'  YP 88'     888o  88 `~~88~~'   `88'   888o  88 88'     88
+// `8bo.   88ooooo 88V8o 88    88       88    88V8o 88 88ooooo 88
+//   `Y8b. 88~~~~~ 88 V8o88    88       88    88 V8o88 88~~~~~ 88
+// db   8D 88.     88  V888    88      .88.   88  V888 88.     88booo.
+// `8888Y' Y88888P VP   V8P    YP    Y888888P VP   V8P Y88888P Y88888P
+
+struct Sentinel {
+    pool: Arc<PoolShared>,
+    respawn: bool,
+}
+
+impl Sentinel {
+    fn new(pool: Arc<PoolShared>) {
+        thread::spawn(move || {
+            // Will spawn a new thread on panic unless it is cancelled.
+            let sentinel = Sentinel {
+                pool: pool,
+                respawn: true,
+            };
+
+            loop {
+                match sentinel.pool.jobs.pop() {
+                    // Execute the job and send the response
+                    Message::Job(job) => {
+                        job.call_box(());
+                    },
+                    // Execute the job and send the response
+                    Message::ScopedJob{job, semaphore} => {
+                        // If the scope is panicked, don't execute jobs from it
+                        if !semaphore.panicked() {
+                            let _guard = SemaphoreGuard(semaphore);
+                            job.call_box(());
+                        }
+                    },
+                    // A message to kill a single thread
+                    Message::Remove => {
+                        sentinel.die();
+                        return
+                    },
+                    // A message the pool is being dropped.
+                    Message::Dropping => {
+                        sentinel.pool.threads.release();
+                        sentinel.die();
+                        return
+                    },
+                }
+            }
+        });
+    }
+
+    // Destroy this sentinel and let the thread die.
+    fn die(mut self) {
+        self.respawn = false;
+    }
+}
+
+impl Drop for Sentinel {
+    fn drop(&mut self) {
+        if self.respawn {
+            Sentinel::new(self.pool.clone())
+        }
+    }
+}
+
+// d8888b.  .d88b.   .d88b.  db
+// 88  `8D .8P  Y8. .8P  Y8. 88
+// 88oodD' 88    88 88    88 88
+// 88~~~   88    88 88    88 88
+// 88      `8b  d8' `8b  d8' 88booo.
+// 88       `Y88P'   `Y88P'  Y88888P
+
+struct PoolShared {
+    threads: Semaphore,
+    jobs: MsQueue<Message>,
+}
+
+/// A threadpool that acts as a handle to a number of threads spawned at construction.
+// `Drop` will not block.
+pub struct Pool {
+    shared: Arc<PoolShared>,
+    count: AtomicUsize,
 }
 
 impl Pool {
     /// Construct a threadpool with the given number of threads.
-    /// Minimum value is `1`.
-    pub fn new(n: u32) -> Pool {
-        assert!(n >= 1);
+    pub fn new(n: usize) -> Self {
+        let shared = Arc::new(PoolShared{
+            threads: Semaphore::new(0),
+            jobs: MsQueue::new(),
+        });
 
-        let (job_sender, job_receiver) = channel();
-        let job_receiver = Arc::new(Mutex::new(job_receiver));
-
-        let mut threads = Vec::with_capacity(n as usize);
-
-        // spawn n threads, put them in waiting mode
+        // Spawn n threads, put them in waiting mode
         for _ in 0..n {
-            let job_receiver = job_receiver.clone();
+            Sentinel::new(shared.clone())
+        }
 
-            let (pool_sync_tx, pool_sync_rx) =
-                sync_channel::<()>(0);
-            let (thread_sync_tx, thread_sync_rx) =
-                sync_channel::<()>(0);
+        Pool{
+            shared: shared,
+            count: AtomicUsize::new(n),
+        }
+    }
 
-            let thread = thread::spawn(move || {
-                loop {
-                    let message = {
-                        // Only lock jobs for the time it takes
-                        // to get a job, not run it.
-                        let lock = job_receiver.lock().unwrap();
-                        lock.recv()
-                    };
+    /// Adds threads to the pool, returning the previous number of threads. The number of threads
+    /// will not overflow.
+    pub fn add_threads(&self, val: usize) -> usize {
+        let mut current = self.count.load(Ordering::Relaxed);
+        if val == 0 { return current; }
 
-                    match message {
-                        Ok(Message::NewJob(job)) => {
-                            job.call_box();
-                        }
-                        Ok(Message::Join) => {
-                            // Syncronize/Join with pool.
-                            // This has to be a two step
-                            // process to ensure that all threads
-                            // finished their work before the pool
-                            // can continue
+        loop {
+            let old = self.count.compare_and_swap(current, current.saturating_add(val), Ordering::Relaxed);
+            if current == old { break }
+            current = old;
+        }
 
-                            // Wait until the pool started syncing with threads
-                            if pool_sync_tx.send(()).is_err() {
-                                // The pool was dropped.
-                                break;
-                            }
+        // Spawn n threads, put them in waiting mode
+        for _ in 0..(current.saturating_add(val) - current) {
+            Sentinel::new(self.shared.clone())
+        }
 
-                            // Wait until the pool finished syncing with threads
-                            if thread_sync_rx.recv().is_err() {
-                                // The pool was dropped.
-                                break;
-                            }
-                        }
-                        Err(..) => {
-                            // The pool was dropped.
-                            break
-                        }
-                    }
+        current
+    }
+
+    /// Removes threads from the pool, returning the previous number of threads. The number of
+    /// threads will not underflow.
+    pub fn sub_threads(&self, val: usize) -> usize {
+        let mut current = self.count.load(Ordering::Relaxed);
+        if val == 0 { return current; }
+
+        loop {
+            let old = self.count.compare_and_swap(current, current.saturating_sub(val), Ordering::Relaxed);
+            if current == old { break }
+            current = old;
+        }
+
+        // Send kill messages to threads
+        for _ in 0..(current - current.saturating_sub(val)) {
+            self.shared.jobs.push(Message::Remove);
+        }
+
+        current
+    }
+
+    /// Sets the number of threads in the pool to the value requested, adding and removing threads
+    /// as needed. Returns the old number of threads
+    pub fn set_threads(&self, new: usize) -> usize {
+        let old = self.count.swap(new, Ordering::Relaxed);
+
+        if new > old {
+            // Spawn n threads, put them in waiting mode
+            for _ in 0..(new-old) {
+                Sentinel::new(self.shared.clone())
+            }
+        } else {
+            // Send kill messages to threads
+            for _ in 0..(old-new) {
+                self.shared.jobs.push(Message::Remove);
+            }
+        }
+
+        old
+    }
+
+    /// Sets the number of threads if the current value is the same as the `current` value.
+    ///
+    /// The return value is always the previous value. If it is equal to current, then the number
+    /// of threads was updated.
+    pub fn compare_and_swap(&self, current: usize, new: usize) -> usize {
+        let old = self.count.compare_and_swap(current, new, Ordering::Relaxed);
+
+        // If current is equal, perform changes
+        if current == old {
+            if new > old {
+                // Spawn n threads, put them in waiting mode
+                for _ in 0..(new-old) {
+                    Sentinel::new(self.shared.clone())
                 }
-            });
-
-            threads.push(ThreadData {
-                _thread_join_handle: thread,
-                pool_sync_rx: pool_sync_rx,
-                thread_sync_tx: thread_sync_tx,
-            });
+            } else {
+                // Send kill messages to threads
+                for _ in 0..(old-new) {
+                    self.shared.jobs.push(Message::Remove);
+                }
+            }
         }
 
-        Pool {
-            threads: threads,
-            job_sender: Some(job_sender),
-        }
+        old
     }
 
-    /// Borrows the pool and allows executing jobs on other
-    /// threads during that scope via the argument of the closure.
+    /// Gets the number of threads. The number of threads may change immediately after this call
+    /// is made.
+    pub fn threads(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    /// Submits a static job for execution on the threadpool.
     ///
-    /// This method will block until the closure and all its jobs have
-    /// run to completion.
-    pub fn scoped<'pool, 'scope, F, R>(&'pool mut self, f: F) -> R
-        where F: FnOnce(&Scope<'pool, 'scope>) -> R
-    {
-        let scope = Scope {
-            pool: self,
-            _marker: PhantomData,
-        };
-        f(&scope)
+    /// The body of the closure will be send to one of the internal threads, and this method itself
+    /// will not wait for its completion.
+    pub fn execute<F: 'static+Send+FnOnce()>(&self, f: F) {
+        self.shared.jobs.push(Message::Job(Box::new(f)));
     }
 
-    /// Returns the number of threads inside this pool.
-    pub fn thread_count(&self) -> u32 {
-        self.threads.len() as u32
+    /// Borrows the pool and allows executing jobs on other threads during that scope via the
+    /// argument of the closure.
+    ///
+    /// This method will block until the closure and all its jobs have run to completion.
+    pub fn scoped<'pool, R, F: FnOnce(&mut Scope<'pool>) -> R>(&'pool self, f: F) -> R {
+        let mut scope = Scope::new(&self.shared.jobs);
+        f(&mut scope)
     }
 }
 
-/////////////////////////////////////////////////////////////////////////////
-
-/// Handle to the scope during which the threadpool is borrowed.
-pub struct Scope<'pool, 'scope> {
-    pool: &'pool mut Pool,
-    // The 'scope needs to be invariant... it seems?
-    _marker: PhantomData<::std::cell::Cell<&'scope mut ()>>,
-}
-
-impl<'pool, 'scope> Scope<'pool, 'scope> {
-    /// Execute a job on the threadpool.
-    ///
-    /// The body of the closure will be send to one of the
-    /// internal threads, and this method itself will not wait
-    /// for its completion.
-    #[cfg(not(compiler_has_scoped_bugfix))]
-    pub unsafe fn execute<F>(&self, f: F) where F: FnOnce() + Send + 'scope {
-        self.execute_(f)
-    }
-
-    /// Execute a job on the threadpool.
-    ///
-    /// The body of the closure will be send to one of the
-    /// internal threads, and this method itself will not wait
-    /// for its completion.
-    #[cfg(compiler_has_scoped_bugfix)]
-    pub fn execute<F>(&self, f: F) where F: FnOnce() + Send + 'scope {
-        self.execute_(f)
-    }
-
-    fn execute_<F>(&self, f: F) where F: FnOnce() + Send + 'scope {
-        let b = unsafe {
-            mem::transmute::<Thunk<'scope>, Thunk<'static>>(Box::new(f))
-        };
-        self.pool.job_sender.as_ref().unwrap().send(Message::NewJob(b)).unwrap();
-    }
-
-    /// Blocks until all currently queued jobs have run to completion.
-    pub fn join_all(&self) {
-        for _ in 0..self.pool.threads.len() {
-            self.pool.job_sender.as_ref().unwrap().send(Message::Join).unwrap();
-        }
-
-        // Syncronize/Join with threads
-        // This has to be a two step process
-        // to make sure _all_ threads received _one_ Join message each.
-
-        // This loop will block on every thread until it
-        // received and reacted to its Join message.
-        for thread_data in &self.pool.threads {
-            thread_data.pool_sync_rx.recv().unwrap();
-        }
-
-        // Once all threads joined the jobs, send them a continue message
-        for thread_data in &self.pool.threads {
-            thread_data.thread_sync_tx.send(()).unwrap();
-        }
-    }
-}
-
-impl<'pool, 'scope> Drop for Scope<'pool, 'scope> {
+impl Drop for Pool {
     fn drop(&mut self) {
-        self.join_all();
+        // Kill all the threads, but don't bother blocking
+        self.set_threads(0);
     }
 }
 
-/////////////////////////////////////////////////////////////////////////////
+//  .d8b.  d8b   db  .o88b. db   db  .d88b.  d8888b. d88888b d8888b.
+// d8' `8b 888o  88 d8P  Y8 88   88 .8P  Y8. 88  `8D 88'     88  `8D
+// 88ooo88 88V8o 88 8P      88ooo88 88    88 88oobY' 88ooooo 88   88
+// 88~~~88 88 V8o88 8b      88~~~88 88    88 88`8b   88~~~~~ 88   88
+// 88   88 88  V888 Y8b  d8 88   88 `8b  d8' 88 `88. 88.     88  .8D
+// YP   YP VP   V8P  `Y88P' YP   YP  `Y88P'  88   YD Y88888P Y8888D'
+
+/// An anchored thread pool that will block on `Drop` until all threads are cleaned up.
+pub struct Anchored {
+    pool: Pool,
+    _marker: PhantomData<* const ()>, // TODO: Convert to !Send. Blocked by rust-lang/rust#13231
+}
+
+// TODO: Convert to !Send. Blocked by rust-lang/rust#13231
+unsafe impl Sync for Anchored {}
+
+impl Anchored {
+    /// Construct a threadpool with the given number of threads.
+    pub fn new(n: usize) -> Self { Anchored{ pool: Pool::new(n), _marker: PhantomData } }
+}
+
+impl Deref for Anchored {
+    type Target = Pool;
+    fn deref(&self) -> &Self::Target { &self.pool }
+}
+
+impl DerefMut for Anchored {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.pool }
+}
+
+impl AsRef<Pool> for Anchored {
+    fn as_ref(&self) -> &Pool { &self.pool }
+}
+
+impl AsMut<Pool> for Anchored {
+    fn as_mut(&mut self) -> &mut Pool { &mut self.pool }
+}
+
+impl Borrow<Pool> for Anchored {
+    fn borrow(&self) -> &Pool { &self.pool }
+}
+
+impl BorrowMut<Pool> for Anchored {
+    fn borrow_mut(&mut self) -> &mut Pool { &mut self.pool }
+}
+
+impl Drop for Anchored {
+    fn drop(&mut self) {
+        // See how many threads we have
+        let n = self.pool.count.swap(0, Ordering::Relaxed);
+
+        // Send drop messages to threads
+        for _ in 0..n {
+            self.pool.shared.jobs.push(Message::Dropping);
+        }
+
+        if !thread::panicking() {
+            self.pool.shared.threads.acquire(n);
+        }
+    }
+}
+
+// .d8888.  .o88b.  .d88b.  d8888b. d88888b
+// 88'  YP d8P  Y8 .8P  Y8. 88  `8D 88'
+// `8bo.   8P      88    88 88oodD' 88ooooo
+//   `Y8b. 8b      88    88 88~~~   88~~~~~
+// db   8D Y8b  d8 `8b  d8' 88      88.
+// `8888Y'  `Y88P'  `Y88P'  88      Y88888P
+
+/// Handle to the scope.
+pub struct Scope<'pool> {
+    jobs: &'pool MsQueue<Message>,
+    job_count: usize,
+    semaphore: Semaphore,
+}
+
+impl <'pool> Scope<'pool> {
+    fn new(jobs: &'pool MsQueue<Message>) -> Self {
+        Scope{
+            jobs: jobs,
+            job_count: 0,
+            semaphore: Semaphore::new(0),
+        }
+    }
+
+    /// Submit a job for execution on the threadpool.
+    ///
+    /// The body of the closure will be send to one of the internal threads, and this method
+    /// itself will not wait for its completion.
+    pub fn execute<'scope, F: 'scope+Send+FnOnce()>(&'scope mut self, f: F)  {
+        // Check the current state and count any completed jobs
+        let (finished, panicked) = self.semaphore.acquire_all();
+        self.job_count -= finished;
+
+        // Block job submission if a panic occurs. Also panic if needed.
+        if panicked {
+            if thread::panicking() {
+                return;
+            } else {
+                panic!("Scoped thread panicked");
+            }
+        }
+
+        // Block job overflow
+        if self.job_count == usize::MAX {
+            panic!("Job overflow, max jobs is {}", usize::MAX)
+        }
+        self.job_count += 1;
+
+        let f = Box::new(f);
+        self.jobs.push(Message::ScopedJob{
+            job: unsafe {
+                mem::transmute::<Thunk<'scope>, Thunk<'static>>(f)
+            },
+            semaphore: unsafe {
+                mem::transmute::<&'scope Semaphore, &'static Semaphore>(&self.semaphore)
+            },
+        });
+    }
+
+    /// Blocks until all submitted jobs have run to completion.
+    pub fn wait_all(&mut self) {
+        // Wait for job completion.
+        let panicked = self.semaphore.acquire(mem::replace(&mut self.job_count, 0));
+
+        // Panic if needed
+        if panicked {
+            if thread::panicking() {
+                return;
+            } else {
+                panic!("Scoped thread panicked");
+            }
+        }
+    }
+}
+
+impl <'pool> Drop for Scope<'pool> {
+    fn drop(&mut self) {
+        self.wait_all();
+    }
+}
+
+// d888888b d88888b .d8888. d888888b
+// `~~88~~' 88'     88'  YP `~~88~~'
+//    88    88ooooo `8bo.      88
+//    88    88~~~~~   `Y8b.    88
+//    88    88.     db   8D    88
+//    YP    Y88888P `8888Y'    YP
 
 #[cfg(test)]
 mod tests {
-    #![cfg_attr(feature="nightly", allow(unused_unsafe))]
-
-    use super::Pool;
+    use super::{Pool, Anchored};
+    use std::borrow::Borrow;
     use std::thread;
-    use std::sync;
+    use std::time::Duration;
+    use std::sync::mpsc::{channel, sync_channel};
 
-    #[test]
-    fn smoketest() {
-        let mut pool = Pool::new(4);
+    #[test] fn smoketest_pool() { smoketest(Pool::new(4)) }
+    #[test] fn smoketest_anchored() { smoketest(Anchored::new(4)) }
+
+    fn smoketest<P: Borrow<Pool>>(pool: P) {
+        let pool = pool.borrow();
 
         for i in 1..7 {
             let mut vec = vec![0, 1, 2, 3, 4];
             pool.scoped(|s| {
                 for e in vec.iter_mut() {
-                    unsafe {
-                        s.execute(move || {
-                            *e += i;
-                        });
-                    }
+                    s.execute(move || {
+                        *e += i;
+                    });
                 }
             });
 
@@ -288,23 +534,98 @@ mod tests {
         }
     }
 
-    #[test]
-    #[should_panic]
-    fn thread_panic() {
-        let mut pool = Pool::new(4);
+    #[test] fn add_pool() { add(Pool::new(0)) }
+    #[test] fn add_anchored() { add(Anchored::new(0)) }
+
+    fn add<P: Borrow<Pool>>(pool: P) {
+        let pool = pool.borrow();
+        pool.add_threads(1);
         pool.scoped(|scoped| {
-            unsafe {
-                scoped.execute(move || {
-                    panic!()
+            let pool = &pool;
+            scoped.execute(move || {
+                pool.sub_threads(1);
+            });
+        });
+    }
+
+    #[test] fn remove_pool() { remove(Pool::new(2)) }
+    #[test] fn remove_anchored() { remove(Anchored::new(2)) }
+
+    fn remove<P: Borrow<Pool>>(pool: P) {
+        let pool = pool.borrow();
+        pool.sub_threads(1);
+        pool.scoped(|scoped| {
+            scoped.execute(move || {
+            });
+        });
+    }
+
+    #[test] fn remove_underflow_pool() { remove_underflow(Pool::new(0)) }
+    #[test] fn remove_underflow_anchored() { remove_underflow(Anchored::new(0)) }
+
+    fn remove_underflow<P: Borrow<Pool>>(pool: P) {
+        let pool = pool.borrow();
+        pool.sub_threads(1);
+        assert_eq!(pool.threads(), 0);
+    }
+
+
+    #[test] fn double_borrow_pool() { double_borrow(Pool::new(2)) }
+    #[test] fn double_borrow_anchored() { double_borrow(Anchored::new(2)) }
+
+    fn double_borrow<P: Borrow<Pool>>(pool: P) {
+        let pool = pool.borrow();
+        pool.scoped(|s| {
+            let pool = &pool;
+            s.execute(move || {
+                pool.scoped(|s2| {
+                    let (tx, rx) = sync_channel(0);
+                    s2.execute(move || {
+                        tx.send(1).unwrap();
+                    });
+                    rx.recv().unwrap();
                 });
-            }
+            });
+        });
+    }
+
+    #[test] fn thread_panic_pool() { thread_panic(Pool::new(2)) }
+    #[test] fn thread_panic_anchored() { thread_panic(Anchored::new(2)) }
+
+    fn thread_panic<P: Borrow<Pool>>(pool: P) {
+        let pool = pool.borrow();
+        let (tx, rx) = channel();
+        pool.execute(move || {
+            let _tx = tx;
+            if false { let _ = _tx.send(()); }
+            panic!();
+        });
+        rx.recv().unwrap_err();
+    }
+
+    #[should_panic]
+    #[test] fn scoped_thread_panic_pool() { scoped_thread_panic(Pool::new(4)) }
+    #[should_panic]
+    #[test] fn scoped_thread_panic_anchored() { scoped_thread_panic(Anchored::new(4)) }
+
+    fn scoped_thread_panic<P: Borrow<Pool>>(pool: P) {
+        let pool = pool.borrow();
+        pool.scoped(|scoped| {
+            scoped.execute(move || {
+                panic!()
+            });
         });
     }
 
     #[test]
     #[should_panic]
-    fn scope_panic() {
-        let mut pool = Pool::new(4);
+    fn scoped_panic_pool() { scope_panic(Pool::new(4)) }
+    #[test]
+    #[should_panic]
+    fn scoped_panic_anchored() { scope_panic(Anchored::new(4)) }
+
+    fn scope_panic<P: Borrow<Pool>>(pool: P) {
+        let pool = pool.borrow();
         pool.scoped(|_scoped| {
             panic!()
         });
@@ -312,177 +633,55 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn pool_panic() {
-        let _pool = Pool::new(4);
+    fn panic_pool() { pool_panic(Pool::new(4)) }
+    #[test]
+    #[should_panic]
+    fn panic_anchored() { pool_panic(Anchored::new(4)) }
+
+    fn pool_panic<P: Borrow<Pool>>(pool: P) {
+        let _pool = pool.borrow();
         panic!()
     }
 
-    #[test]
-    fn join_all() {
-        let mut pool = Pool::new(4);
+    #[test] fn wait_all_pool() { wait_all(Pool::new(4)) }
+    #[test] fn wait_all_anchored() { wait_all(Anchored::new(4)) }
 
-        let (tx_, rx) = sync::mpsc::channel();
+    fn wait_all<P: Borrow<Pool>>(pool: P) {
+        let pool = pool.borrow();
+
+        let (tx_, rx) = channel();
 
         pool.scoped(|scoped| {
             let tx = tx_.clone();
-            unsafe {
-                scoped.execute(move || {
-                    thread::sleep_ms(1000);
-                    tx.send(2).unwrap();
-                });
-            }
+            scoped.execute(move || {
+                thread::sleep(Duration::from_millis(1000));
+                tx.send(2).unwrap();
+            });
 
             let tx = tx_.clone();
-            unsafe {
-                scoped.execute(move || {
-                    tx.send(1).unwrap();
-                });
-            }
+            scoped.execute(move || {
+                tx.send(1).unwrap();
+            });
 
-            scoped.join_all();
+            scoped.wait_all();
 
             let tx = tx_.clone();
-            unsafe {
-                scoped.execute(move || {
-                    tx.send(3).unwrap();
-                });
-            }
+            scoped.execute(move || {
+                tx.send(3).unwrap();
+            });
         });
 
         assert_eq!(rx.iter().take(3).collect::<Vec<_>>(), vec![1, 2, 3]);
     }
 
-    #[test]
-    #[cfg(compiler_has_scoped_bugfix)]
-    fn safe_execute() {
-        let mut pool = Pool::new(4);
+    #[test] fn simple_pool() { simple(Pool::new(4)) }
+    #[test] fn simple_anchored() { simple(Anchored::new(4)) }
+
+    fn simple<P: Borrow<Pool>>(pool: P) {
+        let pool = pool.borrow();
         pool.scoped(|scoped| {
             scoped.execute(move || {
             });
         });
-    }
-}
-
-#[cfg(all(test, feature="nightly"))]
-mod benches {
-    extern crate test;
-
-    use self::test::{Bencher, black_box};
-    use super::Pool;
-    use std::sync::Mutex;
-
-    // const MS_SLEEP_PER_OP: u32 = 1;
-
-    lazy_static! {
-        static ref POOL_1: Mutex<Pool> = Mutex::new(Pool::new(1));
-        static ref POOL_2: Mutex<Pool> = Mutex::new(Pool::new(2));
-        static ref POOL_3: Mutex<Pool> = Mutex::new(Pool::new(3));
-        static ref POOL_4: Mutex<Pool> = Mutex::new(Pool::new(4));
-        static ref POOL_5: Mutex<Pool> = Mutex::new(Pool::new(5));
-        static ref POOL_8: Mutex<Pool> = Mutex::new(Pool::new(8));
-    }
-
-    fn fib(n: u64) -> u64 {
-        let mut prev_prev: u64 = 1;
-        let mut prev = 1;
-        let mut current = 1;
-        for _ in 2..(n+1) {
-            current = prev_prev.wrapping_add(prev);
-            prev_prev = prev;
-            prev = current;
-        }
-        current
-    }
-
-    fn threads_interleaved_n(pool: &mut Pool)  {
-        let size = 1024; // 1kiB
-
-        let mut data = vec![1u8; size];
-        pool.scoped(|s| {
-            for e in data.iter_mut() {
-                s.execute(move || {
-                    *e += fib(black_box(1000 * (*e as u64))) as u8;
-                    for i in 0..10000 { black_box(i); }
-                    //thread::sleep_ms(MS_SLEEP_PER_OP);
-                });
-            }
-        });
-    }
-
-    #[bench]
-    fn threads_interleaved_1(b: &mut Bencher) {
-        b.iter(|| threads_interleaved_n(&mut POOL_1.lock().unwrap()))
-    }
-
-    #[bench]
-    fn threads_interleaved_2(b: &mut Bencher) {
-        b.iter(|| threads_interleaved_n(&mut POOL_2.lock().unwrap()))
-    }
-
-    #[bench]
-    fn threads_interleaved_4(b: &mut Bencher) {
-        b.iter(|| threads_interleaved_n(&mut POOL_4.lock().unwrap()))
-    }
-
-    #[bench]
-    fn threads_interleaved_8(b: &mut Bencher) {
-        b.iter(|| threads_interleaved_n(&mut POOL_8.lock().unwrap()))
-    }
-
-    fn threads_chunked_n(pool: &mut Pool) {
-        // Set this to 1GB and 40 to get good but slooow results
-        let size = 1024 * 1024 * 10 / 4; // 10MiB
-        let bb_repeat = 50;
-
-        let n = pool.thread_count();
-        let mut data = vec![0u32; size];
-        pool.scoped(|s| {
-            let l = (data.len() - 1) / n as usize + 1;
-            for es in data.chunks_mut(l) {
-                s.execute(move || {
-                    if es.len() > 1 {
-                        es[0] = 1;
-                        es[1] = 1;
-                        for i in 2..es.len() {
-                            // Fibonnaci gets big fast,
-                            // so just wrap around all the time
-                            es[i] = black_box(es[i-1].wrapping_add(es[i-2]));
-                            for i in 0..bb_repeat { black_box(i); }
-                        }
-                    }
-                    //thread::sleep_ms(MS_SLEEP_PER_OP);
-                });
-            }
-        });
-    }
-
-    #[bench]
-    fn threads_chunked_1(b: &mut Bencher) {
-        b.iter(|| threads_chunked_n(&mut POOL_1.lock().unwrap()))
-    }
-
-    #[bench]
-    fn threads_chunked_2(b: &mut Bencher) {
-        b.iter(|| threads_chunked_n(&mut POOL_2.lock().unwrap()))
-    }
-
-    #[bench]
-    fn threads_chunked_3(b: &mut Bencher) {
-        b.iter(|| threads_chunked_n(&mut POOL_3.lock().unwrap()))
-    }
-
-    #[bench]
-    fn threads_chunked_4(b: &mut Bencher) {
-        b.iter(|| threads_chunked_n(&mut POOL_4.lock().unwrap()))
-    }
-
-    #[bench]
-    fn threads_chunked_5(b: &mut Bencher) {
-        b.iter(|| threads_chunked_n(&mut POOL_5.lock().unwrap()))
-    }
-
-    #[bench]
-    fn threads_chunked_8(b: &mut Bencher) {
-        b.iter(|| threads_chunked_n(&mut POOL_8.lock().unwrap()))
     }
 }
