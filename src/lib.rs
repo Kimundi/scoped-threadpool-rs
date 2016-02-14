@@ -52,7 +52,7 @@
 extern crate lazy_static;
 
 use std::thread::{self, JoinHandle};
-use std::sync::mpsc::{channel, Sender, Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{channel, Sender, Receiver, SyncSender, sync_channel, RecvError};
 use std::sync::{Arc, Mutex};
 use std::marker::PhantomData;
 use std::mem;
@@ -236,8 +236,15 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
 
         // This loop will block on every thread until it
         // received and reacted to its Join message.
+        let mut worker_panic = false;
         for thread_data in &self.pool.threads {
-            thread_data.pool_sync_rx.recv().unwrap();
+            if let Err(RecvError) = thread_data.pool_sync_rx.recv() {
+                worker_panic = true;
+            }
+        }
+        if worker_panic {
+            // Now that all the threads are paused, we can safely panic
+            panic!("Thread pool worker panicked");
         }
 
         // Once all threads joined the jobs, send them a continue message
@@ -350,6 +357,46 @@ mod tests {
         });
 
         assert_eq!(rx.iter().take(3).collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn join_all_with_thread_panic() {
+        use std::sync::mpsc::Sender;
+        struct OnScopeEnd(Sender<u8>);
+        impl Drop for OnScopeEnd {
+            fn drop(&mut self) {
+                self.0.send(1).unwrap();
+                thread::sleep_ms(200);
+            }
+        }
+        let (tx_, rx) = sync::mpsc::channel();
+        // Use a thread here to handle the expected panic from the pool. Should
+        // be switched to use panic::recover instead when it becomes stable.
+        let handle = thread::spawn(move || {
+            let mut pool = Pool::new(8);
+            let _on_scope_end = OnScopeEnd(tx_.clone());
+            pool.scoped(|scoped| {
+                scoped.execute(move || {
+                    thread::sleep_ms(100);
+                    panic!();
+                });
+                for _ in 1..8 {
+                    let tx = tx_.clone();
+                    scoped.execute(move || {
+                        thread::sleep_ms(200);
+                        tx.send(0).unwrap();
+                    });
+                }
+            });
+        });
+        if let Ok(..) = handle.join() {
+            panic!("Pool didn't panic as expected");
+        }
+        // If the `1` that OnScopeEnd sent occurs anywhere else than at the
+        // end, that means that a worker thread was still running even
+        // after the `scoped` call finished, which is unsound.
+        let values: Vec<u8> = rx.into_iter().collect();
+        assert_eq!(&values[..], &[0, 0, 0, 0, 0, 0, 0, 1]);
     }
 
     #[test]
