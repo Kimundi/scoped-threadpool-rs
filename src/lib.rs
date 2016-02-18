@@ -29,12 +29,9 @@
 //!         // Create references to each element in the vector ...
 //!         for e in &mut vec {
 //!             // ... and add 1 to it in a seperate thread
-//!             // (execute() is safe to call in nightly)
-//!             unsafe {
-//!                 scope.execute(move || {
-//!                     *e += 1;
-//!                 });
-//!             }
+//!             scope.execute(move || {
+//!                 *e += 1;
+//!             });
 //!         }
 //!     });
 //!
@@ -202,17 +199,6 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
     /// The body of the closure will be send to one of the
     /// internal threads, and this method itself will not wait
     /// for its completion.
-    #[cfg(not(compiler_has_scoped_bugfix))]
-    pub unsafe fn execute<F>(&self, f: F) where F: FnOnce() + Send + 'scope {
-        self.execute_(f)
-    }
-
-    /// Execute a job on the threadpool.
-    ///
-    /// The body of the closure will be send to one of the
-    /// internal threads, and this method itself will not wait
-    /// for its completion.
-    #[cfg(compiler_has_scoped_bugfix)]
     pub fn execute<F>(&self, f: F) where F: FnOnce() + Send + 'scope {
         self.execute_(f)
     }
@@ -230,7 +216,7 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
             self.pool.job_sender.as_ref().unwrap().send(Message::Join).unwrap();
         }
 
-        // Syncronize/Join with threads
+        // Synchronize/Join with threads
         // This has to be a two step process
         // to make sure _all_ threads received _one_ Join message each.
 
@@ -269,6 +255,11 @@ mod tests {
     use super::Pool;
     use std::thread;
     use std::sync;
+    use std::time;
+
+    fn sleep_ms(ms: u64) {
+        thread::sleep(time::Duration::from_millis(ms));
+    }
 
     #[test]
     fn smoketest() {
@@ -278,11 +269,9 @@ mod tests {
             let mut vec = vec![0, 1, 2, 3, 4];
             pool.scoped(|s| {
                 for e in vec.iter_mut() {
-                    unsafe {
-                        s.execute(move || {
-                            *e += i;
-                        });
-                    }
+                    s.execute(move || {
+                        *e += i;
+                    });
                 }
             });
 
@@ -300,11 +289,9 @@ mod tests {
     fn thread_panic() {
         let mut pool = Pool::new(4);
         pool.scoped(|scoped| {
-            unsafe {
-                scoped.execute(move || {
-                    panic!()
-                });
-            }
+            scoped.execute(move || {
+                panic!()
+            });
         });
     }
 
@@ -332,28 +319,22 @@ mod tests {
 
         pool.scoped(|scoped| {
             let tx = tx_.clone();
-            unsafe {
-                scoped.execute(move || {
-                    thread::sleep_ms(1000);
-                    tx.send(2).unwrap();
-                });
-            }
+            scoped.execute(move || {
+                sleep_ms(1000);
+                tx.send(2).unwrap();
+            });
 
             let tx = tx_.clone();
-            unsafe {
-                scoped.execute(move || {
-                    tx.send(1).unwrap();
-                });
-            }
+            scoped.execute(move || {
+                tx.send(1).unwrap();
+            });
 
             scoped.join_all();
 
             let tx = tx_.clone();
-            unsafe {
-                scoped.execute(move || {
-                    tx.send(3).unwrap();
-                });
-            }
+            scoped.execute(move || {
+                tx.send(3).unwrap();
+            });
         });
 
         assert_eq!(rx.iter().take(3).collect::<Vec<_>>(), vec![1, 2, 3]);
@@ -366,7 +347,7 @@ mod tests {
         impl Drop for OnScopeEnd {
             fn drop(&mut self) {
                 self.0.send(1).unwrap();
-                thread::sleep_ms(200);
+                sleep_ms(200);
             }
         }
         let (tx_, rx) = sync::mpsc::channel();
@@ -377,13 +358,13 @@ mod tests {
             let _on_scope_end = OnScopeEnd(tx_.clone());
             pool.scoped(|scoped| {
                 scoped.execute(move || {
-                    thread::sleep_ms(100);
+                    sleep_ms(100);
                     panic!();
                 });
                 for _ in 1..8 {
                     let tx = tx_.clone();
                     scoped.execute(move || {
-                        thread::sleep_ms(200);
+                        sleep_ms(200);
                         tx.send(0).unwrap();
                     });
                 }
@@ -400,7 +381,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(compiler_has_scoped_bugfix)]
     fn safe_execute() {
         let mut pool = Pool::new(4);
         pool.scoped(|scoped| {
@@ -450,7 +430,7 @@ mod benches {
                 s.execute(move || {
                     *e += fib(black_box(1000 * (*e as u64))) as u8;
                     for i in 0..10000 { black_box(i); }
-                    //thread::sleep_ms(MS_SLEEP_PER_OP);
+                    //sleep_ms(MS_SLEEP_PER_OP);
                 });
             }
         });
@@ -497,7 +477,7 @@ mod benches {
                             for i in 0..bb_repeat { black_box(i); }
                         }
                     }
-                    //thread::sleep_ms(MS_SLEEP_PER_OP);
+                    //sleep_ms(MS_SLEEP_PER_OP);
                 });
             }
         });
