@@ -47,7 +47,8 @@ use std::borrow::{Borrow, BorrowMut};
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex, Condvar};
 use std::thread::{self};
 use std::usize;
@@ -147,19 +148,19 @@ struct Sentinel {
 
 impl Sentinel {
     fn new(pool: Arc<PoolShared>) {
-        thread::spawn(move || {
+        let builder = thread::Builder::new();
+        let builder = if let Some(stack_size) = pool.stack_size {
+            builder.stack_size(stack_size)
+        } else { builder };
+
+        builder.spawn(move || {
             // Will spawn a new thread on panic unless it is cancelled.
-            let sentinel = Sentinel {
-                pool: pool,
-                respawn: true,
-            };
+            let sentinel = Sentinel { pool: pool, respawn: true };
 
             loop {
                 match sentinel.pool.jobs.pop() {
                     // Execute the job and send the response
-                    Message::Job(job) => {
-                        job.call_box(());
-                    },
+                    Message::Job(job) => job.call_box(()),
                     // Execute the job and send the response
                     Message::ScopedJob{job, semaphore} => {
                         // If the scope is panicked, don't execute jobs from it
@@ -181,7 +182,7 @@ impl Sentinel {
                     },
                 }
             }
-        });
+        }).unwrap();
     }
 
     // Destroy this sentinel and let the thread die.
@@ -192,11 +193,59 @@ impl Sentinel {
 
 impl Drop for Sentinel {
     fn drop(&mut self) {
-        if self.respawn {
-            Sentinel::new(self.pool.clone())
+        if self.respawn { Sentinel::new(self.pool.clone()) }
+    }
+}
+
+// d8888b. db    db d888888b db      d8888b. d88888b d8888b.
+// 88  `8D 88    88   `88'   88      88  `8D 88'     88  `8D
+// 88oooY' 88    88    88    88      88   88 88ooooo 88oobY'
+// 88~~~b. 88    88    88    88      88   88 88~~~~~ 88`8b
+// 88   8D 88b  d88   .88.   88booo. 88  .8D 88.     88 `88.
+// Y8888P' ~Y8888P' Y888888P Y88888P Y8888D' Y88888P 88   YD
+
+/// Pool configuration. Provides detailed control over the properties and behavior of new threads.
+pub struct Builder {
+    // The size of the stack for the spawned thread
+    stack_size: Option<usize>,
+}
+
+impl Builder {
+    /// Generates the base configuration for constructing a threadpool, from which configuration
+    /// methods can be chained.
+    pub fn new() -> Builder {
+        Builder {
+            stack_size: None,
+        }
+    }
+
+    /// Sets the size of the stack for the threadpool threads.
+    pub fn stack_size(mut self, size: usize) -> Self {
+        self.stack_size = Some(size);
+        self
+    }
+
+    /// Construct a threadpool with the given number of threads.
+    pub fn build(self, threads: usize) -> Pool {
+        let Builder { stack_size } = self;
+
+        let shared = Arc::new(PoolShared{
+            threads: Semaphore::new(0),
+            stack_size: stack_size,
+            jobs: MsQueue::new(),
+        });
+
+        // Spawn n threads, put them in waiting mode
+        for _ in 0..threads { Sentinel::new(shared.clone()) }
+
+        Pool{
+            shared: shared,
+            count: AtomicUsize::new(threads),
         }
     }
 }
+
+
 
 // d8888b.  .d88b.   .d88b.  db
 // 88  `8D .8P  Y8. .8P  Y8. 88
@@ -207,6 +256,7 @@ impl Drop for Sentinel {
 
 struct PoolShared {
     threads: Semaphore,
+    stack_size: Option<usize>,
     jobs: MsQueue<Message>,
 }
 
@@ -219,31 +269,16 @@ pub struct Pool {
 
 impl Pool {
     /// Construct a threadpool with the given number of threads.
-    pub fn new(n: usize) -> Self {
-        let shared = Arc::new(PoolShared{
-            threads: Semaphore::new(0),
-            jobs: MsQueue::new(),
-        });
-
-        // Spawn n threads, put them in waiting mode
-        for _ in 0..n {
-            Sentinel::new(shared.clone())
-        }
-
-        Pool{
-            shared: shared,
-            count: AtomicUsize::new(n),
-        }
-    }
+    pub fn new(threads: usize) -> Self { Builder::new().build(threads) }
 
     /// Adds threads to the pool, returning the previous number of threads. The number of threads
     /// will not overflow.
     pub fn add_threads(&self, val: usize) -> usize {
-        let mut current = self.count.load(Ordering::Relaxed);
+        let mut current = self.count.load(Relaxed);
         if val == 0 { return current; }
 
         loop {
-            let old = self.count.compare_and_swap(current, current.saturating_add(val), Ordering::Relaxed);
+            let old = self.count.compare_and_swap(current, current.saturating_add(val), Relaxed);
             if current == old { break }
             current = old;
         }
@@ -259,11 +294,11 @@ impl Pool {
     /// Removes threads from the pool, returning the previous number of threads. The number of
     /// threads will not underflow.
     pub fn sub_threads(&self, val: usize) -> usize {
-        let mut current = self.count.load(Ordering::Relaxed);
+        let mut current = self.count.load(Relaxed);
         if val == 0 { return current; }
 
         loop {
-            let old = self.count.compare_and_swap(current, current.saturating_sub(val), Ordering::Relaxed);
+            let old = self.count.compare_and_swap(current, current.saturating_sub(val), Relaxed);
             if current == old { break }
             current = old;
         }
@@ -279,7 +314,7 @@ impl Pool {
     /// Sets the number of threads in the pool to the value requested, adding and removing threads
     /// as needed. Returns the old number of threads
     pub fn set_threads(&self, new: usize) -> usize {
-        let old = self.count.swap(new, Ordering::Relaxed);
+        let old = self.count.swap(new, Relaxed);
 
         if new > old {
             // Spawn n threads, put them in waiting mode
@@ -300,8 +335,8 @@ impl Pool {
     ///
     /// The return value is always the previous value. If it is equal to current, then the number
     /// of threads was updated.
-    pub fn compare_and_swap(&self, current: usize, new: usize) -> usize {
-        let old = self.count.compare_and_swap(current, new, Ordering::Relaxed);
+    pub fn compare_and_swap_threads(&self, current: usize, new: usize) -> usize {
+        let old = self.count.compare_and_swap(current, new, Relaxed);
 
         // If current is equal, perform changes
         if current == old {
@@ -324,7 +359,7 @@ impl Pool {
     /// Gets the number of threads. The number of threads may change immediately after this call
     /// is made.
     pub fn threads(&self) -> usize {
-        self.count.load(Ordering::Relaxed)
+        self.count.load(Relaxed)
     }
 
     /// Submits a static job for execution on the threadpool.
@@ -401,7 +436,7 @@ impl BorrowMut<Pool> for Anchored {
 impl Drop for Anchored {
     fn drop(&mut self) {
         // See how many threads we have
-        let n = self.pool.count.swap(0, Ordering::Relaxed);
+        let n = self.pool.count.swap(0, Relaxed);
 
         // Send drop messages to threads
         for _ in 0..n {
