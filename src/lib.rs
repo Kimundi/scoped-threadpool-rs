@@ -41,6 +41,7 @@
 
 #![cfg_attr(all(feature="nightly", test), feature(test))]
 #![cfg_attr(feature="nightly", feature(drop_types_in_const))]
+#![cfg_attr(all(feature="nightly", test), feature(core_intrinsics))]
 #![cfg_attr(feature="nightly", feature(const_fn))]
 
 #![warn(missing_docs)]
