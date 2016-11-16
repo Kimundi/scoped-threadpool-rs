@@ -66,7 +66,6 @@ fn demo_heap_allocated() {
     }
 }
 
-#[cfg(test)]
 pub fn kernel(r: &PositivelyAtomic, saw_zero: &AtomicBool) {
     // Create a threadpool holding 4 threads
     let mut pool = Pool::new(4);
