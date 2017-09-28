@@ -43,6 +43,7 @@
 #![cfg_attr(feature="nightly", feature(drop_types_in_const))]
 #![cfg_attr(all(feature="nightly", test), feature(core_intrinsics))]
 #![cfg_attr(feature="nightly", feature(const_fn))]
+#![cfg_attr(feature="nightly", feature(const_unsafe_cell_new))]
 
 #![warn(missing_docs)]
 

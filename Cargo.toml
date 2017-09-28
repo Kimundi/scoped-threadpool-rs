@@ -12,7 +12,7 @@ repository = "https://github.com/Kimundi/scoped-threadpool-rs"
 keywords = ["thread", "scoped", "pool", "cached", "threadpool"]
 
 [dev-dependencies]
-lazy_static = "0.1.15"
+lazy_static = "0.2"
 
 [features]
 nightly = []
