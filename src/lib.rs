@@ -210,13 +210,19 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
         let b = unsafe {
             mem::transmute::<Thunk<'scope>, Thunk<'static>>(Box::new(f))
         };
-        self.pool.job_sender.as_ref().unwrap().send(Message::NewJob(b)).unwrap();
+        // This will return Err if one of the worker threads has
+        // panicked, and so we will lose the task to be submitted.
+        // However, we panic later on anyway, so that won't matter.
+        let _ = self.pool.job_sender.as_ref().unwrap().send(Message::NewJob(b));
     }
 
     /// Blocks until all currently queued jobs have run to completion.
     pub fn join_all(&self) {
         for _ in 0..self.pool.threads.len() {
-            self.pool.job_sender.as_ref().unwrap().send(Message::Join).unwrap();
+            // This will return Err if one of the worker threads has
+            // panicked, but that's fine - that will be detected later
+            // on.
+            let _ = self.pool.job_sender.as_ref().unwrap().send(Message::Join);
         }
 
         // Synchronize/Join with threads
