@@ -2,7 +2,7 @@ extern crate scoped_threadpool;
 
 use scoped_threadpool::Pool;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::atomic::{AtomicBool, ATOMIC_BOOL_INIT};
+use std::sync::atomic::AtomicBool;
 use std::panic::AssertUnwindSafe;
 
 // The representation invariant for PositivelyAtomic is that it is
@@ -35,7 +35,7 @@ impl PositivelyAtomic {
 
 #[test]
 fn demo_stack_allocated() {
-    static SAW_ZERO: AtomicBool = ATOMIC_BOOL_INIT;
+    static SAW_ZERO: AtomicBool = AtomicBool::new(false);
     for _i in 0..100 {
         let saw_zero = &AssertUnwindSafe(&SAW_ZERO);
         let _p = ::std::panic::catch_unwind(move || {
@@ -51,7 +51,7 @@ fn demo_stack_allocated() {
 
 #[test]
 fn demo_heap_allocated() {
-    static SAW_ZERO: AtomicBool = ATOMIC_BOOL_INIT;
+    static SAW_ZERO: AtomicBool = AtomicBool::new(false);
     for i in 0..100 {
         let saw_zero = &AssertUnwindSafe(&SAW_ZERO);
         let _p = ::std::panic::catch_unwind(move || {
