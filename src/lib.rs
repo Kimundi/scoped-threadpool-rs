@@ -47,10 +47,6 @@
 
 #![warn(missing_docs)]
 
-#[macro_use]
-#[cfg(test)]
-extern crate lazy_static;
-
 use std::thread::{self, JoinHandle};
 use std::sync::mpsc::{channel, Sender, Receiver, SyncSender, sync_channel, RecvError};
 use std::sync::{Arc, Mutex};
@@ -72,7 +68,7 @@ impl<F: FnOnce()> FnBox for F {
     }
 }
 
-type Thunk<'a> = Box<FnBox + Send + 'a>;
+type Thunk<'a> = Box<dyn FnBox + Send + 'a>;
 
 impl Drop for Pool {
     fn drop(&mut self) {
@@ -403,14 +399,12 @@ mod benches {
 
     // const MS_SLEEP_PER_OP: u32 = 1;
 
-    lazy_static! {
-        static ref POOL_1: Mutex<Pool> = Mutex::new(Pool::new(1));
-        static ref POOL_2: Mutex<Pool> = Mutex::new(Pool::new(2));
-        static ref POOL_3: Mutex<Pool> = Mutex::new(Pool::new(3));
-        static ref POOL_4: Mutex<Pool> = Mutex::new(Pool::new(4));
-        static ref POOL_5: Mutex<Pool> = Mutex::new(Pool::new(5));
-        static ref POOL_8: Mutex<Pool> = Mutex::new(Pool::new(8));
-    }
+    static POOL_1: Mutex<Pool> = Mutex::new(Pool::new(1));
+    static POOL_2: Mutex<Pool> = Mutex::new(Pool::new(2));
+    static POOL_3: Mutex<Pool> = Mutex::new(Pool::new(3));
+    static POOL_4: Mutex<Pool> = Mutex::new(Pool::new(4));
+    static POOL_5: Mutex<Pool> = Mutex::new(Pool::new(5));
+    static POOL_8: Mutex<Pool> = Mutex::new(Pool::new(8));
 
     fn fib(n: u64) -> u64 {
         let mut prev_prev: u64 = 1;
