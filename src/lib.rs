@@ -95,10 +95,8 @@ struct ThreadData {
 
 impl Pool {
     /// Construct a threadpool with the given number of threads.
-    /// Minimum value is `1`.
+    /// Requesting 0 threads will run the requests on the current thread
     pub fn new(n: u32) -> Pool {
-        assert!(n >= 1);
-
         let (job_sender, job_receiver) = channel();
         let job_receiver = Arc::new(Mutex::new(job_receiver));
 
@@ -113,7 +111,7 @@ impl Pool {
             let (thread_sync_tx, thread_sync_rx) =
                 sync_channel::<()>(0);
 
-            let thread = thread::spawn(move || {
+            let thread = thread::Builder::new().spawn(move || {
                 loop {
                     let message = {
                         // Only lock jobs for the time it takes
@@ -152,6 +150,14 @@ impl Pool {
                     }
                 }
             });
+
+            let thread = match thread {
+                Ok(thread) => thread,
+                Err(_) => return Pool {
+                    threads: vec![],
+                    job_sender: None,
+                },
+            };
 
             threads.push(ThreadData {
                 _thread_join_handle: thread,
@@ -207,10 +213,14 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
     }
 
     fn execute_<F>(&self, f: F) where F: FnOnce() + Send + 'scope {
-        let b = unsafe {
-            mem::transmute::<Thunk<'scope>, Thunk<'static>>(Box::new(f))
-        };
-        self.pool.job_sender.as_ref().unwrap().send(Message::NewJob(b)).unwrap();
+        if self.pool.threads.len() > 0 {
+            let b = unsafe {
+                mem::transmute::<Thunk<'scope>, Thunk<'static>>(Box::new(f))
+            };
+            self.pool.job_sender.as_ref().unwrap().send(Message::NewJob(b)).unwrap();
+        } else {
+            f();
+        }
     }
 
     /// Blocks until all currently queued jobs have run to completion.
